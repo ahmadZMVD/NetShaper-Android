@@ -545,7 +545,7 @@ class NetShaperForegroundService : Service() {
         private const val CHANNEL_ID = "netshaper_tunnel_channel"
         private const val NOTIFICATION_ID = 7001
 
-        private const val MAX_WAKELOCK_MS = 60_000L
+        private const val MAX_WAKELOCK_MS = 120_000L
         private const val STOP_WAKELOCK_MS = 15_000L
         private const val HANDOVER_WAKELOCK_MS = 12_000L
         private const val FOREGROUND_POLL_MS = 1_000L

@@ -15,7 +15,10 @@ class AppPreferencesStore(context: Context) {
         set(value) { prefs.edit().putString(KEY_CODESPACE_NAME, value.trim()).apply() }
 
     var oauthClientId: String
-        get() = prefs.getString(KEY_OAUTH_CLIENT_ID, "") ?: ""
+        get() {
+            val saved = prefs.getString(KEY_OAUTH_CLIENT_ID, "")?.trim().orEmpty()
+            return saved.ifBlank { DEFAULT_OAUTH_CLIENT_ID }
+        }
         set(value) { prefs.edit().putString(KEY_OAUTH_CLIENT_ID, value.trim()).apply() }
 
     var stopOnExit: Boolean
@@ -38,5 +41,6 @@ class AppPreferencesStore(context: Context) {
         private const val KEY_ENABLE_IDLE_PARKING = "enable_idle_parking"
         private const val KEY_VPN_BANNER_DISMISSED = "vpn_banner_dismissed"
         const val DEFAULT_CODESPACE = "netshaper-edge-prod"
+        const val DEFAULT_OAUTH_CLIENT_ID = "178c6fc778ccc68e1d6a"
     }
 }

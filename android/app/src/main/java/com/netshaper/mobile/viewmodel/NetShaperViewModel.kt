@@ -14,6 +14,7 @@ import com.netshaper.mobile.engine.TerminalLogLine
 import com.netshaper.mobile.engine.VpnBypassState
 import com.netshaper.mobile.oem.BatterySurvivalHelper
 import com.netshaper.mobile.oem.PermissionReadinessState
+import com.netshaper.mobile.security.AppPreferencesStore
 import com.netshaper.mobile.service.NetShaperForegroundService
 import com.netshaper.mobile.service.NetShaperRuntime
 import kotlinx.coroutines.Dispatchers
@@ -35,9 +36,10 @@ enum class MainTab { HOME, TERMINAL, ACCOUNT }
 data class AccountUiState(
     val hasToken: Boolean = false,
     val maskedToken: String? = null,
-    val oauthClientId: String = "",
+    val oauthClientId: String = AppPreferencesStore.DEFAULT_OAUTH_CLIENT_ID,
     val deviceAuth: DeviceAuthStart? = null,
     val isPollingDeviceAuth: Boolean = false,
+    val deviceAuthStatusNote: String? = null,
     val codespaceName: String = "netshaper-edge-prod",
     val codespaces: List<CodespaceItem> = emptyList(),
     val isLoadingCodespaces: Boolean = false,
@@ -288,10 +290,10 @@ class NetShaperViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun startDeviceAuth(clientIdInput: String) {
         val clientId = clientIdInput.trim().ifBlank {
-            if (!isNativeCore) "Ov23liNetShaperPhase4Demo" else ""
+            if (!isNativeCore) "Ov23liNetShaperPhase4Demo" else AppPreferencesStore.DEFAULT_OAUTH_CLIENT_ID
         }
         if (clientId.isBlank()) {
-            emitSnackbar("Enter a GitHub OAuth App Client ID or use Option B (PAT)")
+            emitSnackbar("Enter a GitHub OAuth App Client ID or use Option B (Token)")
             return
         }
         updateOauthClientId(clientId)
@@ -308,7 +310,11 @@ class NetShaperViewModel(application: Application) : AndroidViewModel(applicatio
                     return@onSuccess
                 }
                 _accountState.update {
-                    it.copy(deviceAuth = startInfo, isPollingDeviceAuth = true)
+                    it.copy(
+                        deviceAuth = startInfo,
+                        isPollingDeviceAuth = true,
+                        deviceAuthStatusNote = null
+                    )
                 }
                 emitSnackbar("Code ${startInfo.userCode} ready — verify in browser")
                 beginDeviceAuthPolling(clientId, startInfo)
@@ -323,12 +329,15 @@ class NetShaperViewModel(application: Application) : AndroidViewModel(applicatio
         devicePollJob = viewModelScope.launch {
             var intervalSec = startInfo.interval.coerceAtLeast(2)
             val deadlineMs = System.currentTimeMillis() + startInfo.expiresIn.coerceAtLeast(60) * 1000L
+            var consecutiveNetErrors = 0
+            val maxConsecutiveNetErrors = 8
             while (isActive && System.currentTimeMillis() < deadlineMs) {
                 delay(intervalSec * 1000L)
                 val pollRes = withContext(Dispatchers.IO) {
                     NetShaperRuntime.engine.pollDeviceAuthJson(clientId, startInfo.deviceCode)
                 }
                 pollRes.onSuccess { raw ->
+                    consecutiveNetErrors = 0
                     val poll = DeviceAuthPoll.fromJson(raw)
                     when (poll.status) {
                         "authorized" -> {
@@ -343,38 +352,84 @@ class NetShaperViewModel(application: Application) : AndroidViewModel(applicatio
                                         hasToken = true,
                                         maskedToken = savedPreview,
                                         deviceAuth = null,
-                                        isPollingDeviceAuth = false
+                                        isPollingDeviceAuth = false,
+                                        deviceAuthStatusNote = null
                                     )
                                 }
                                 emitSnackbar("Signed in to GitHub (encrypted in AndroidKeyStore)")
                                 refreshCodespaces()
                             } else {
-                                _accountState.update { it.copy(deviceAuth = null, isPollingDeviceAuth = false) }
+                                _accountState.update {
+                                    it.copy(
+                                        deviceAuth = null,
+                                        isPollingDeviceAuth = false,
+                                        deviceAuthStatusNote = null
+                                    )
+                                }
                                 emitSnackbar("Authorization succeeded but Keystore rejected token")
                             }
                             return@launch
                         }
-                        "slow_down" -> intervalSec = (poll.interval.takeIf { it > 0 } ?: (intervalSec + 5))
+                        "slow_down" -> {
+                            intervalSec = (poll.interval.takeIf { it > 0 } ?: (intervalSec + 5))
+                            _accountState.update { it.copy(deviceAuthStatusNote = null) }
+                        }
+                        "pending" -> {
+                            _accountState.update { it.copy(deviceAuthStatusNote = null) }
+                        }
                         "expired", "denied", "error" -> {
-                            _accountState.update { it.copy(deviceAuth = null, isPollingDeviceAuth = false) }
+                            _accountState.update {
+                                it.copy(
+                                    deviceAuth = null,
+                                    isPollingDeviceAuth = false,
+                                    deviceAuthStatusNote = null
+                                )
+                            }
                             emitSnackbar("Device Flow ${poll.status}: ${poll.error.ifBlank { "please retry" }}")
                             return@launch
                         }
                     }
                 }.onFailure { err ->
-                    _accountState.update { it.copy(isPollingDeviceAuth = false) }
-                    emitSnackbar("Poll error: ${err.message ?: "network failure"}")
-                    return@launch
+                    consecutiveNetErrors++
+                    if (consecutiveNetErrors >= maxConsecutiveNetErrors || System.currentTimeMillis() >= deadlineMs) {
+                        _accountState.update {
+                            it.copy(
+                                isPollingDeviceAuth = false,
+                                deviceAuthStatusNote = "Polling stopped after $consecutiveNetErrors network errors"
+                            )
+                        }
+                        emitSnackbar("Poll failed after $consecutiveNetErrors retries: ${err.message ?: "network failure"}")
+                        return@launch
+                    }
+                    intervalSec = intervalSec.coerceIn(2, 8)
+                    _accountState.update {
+                        it.copy(
+                            isPollingDeviceAuth = true,
+                            deviceAuthStatusNote = "Retrying network ($consecutiveNetErrors/$maxConsecutiveNetErrors)..."
+                        )
+                    }
                 }
             }
-            _accountState.update { it.copy(deviceAuth = null, isPollingDeviceAuth = false) }
+            _accountState.update {
+                it.copy(
+                    deviceAuth = null,
+                    isPollingDeviceAuth = false,
+                    deviceAuthStatusNote = null
+                )
+            }
         }
     }
 
     fun cancelDeviceAuth() {
         devicePollJob?.cancel()
         devicePollJob = null
-        _accountState.update { it.copy(deviceAuth = null, isPollingDeviceAuth = false) }
+        _accountState.update {
+            it.copy(
+                deviceAuth = null,
+                isPollingDeviceAuth = false,
+                deviceAuthStatusNote = null
+            )
+        }
     }
 
     fun updateCodespaceName(name: String): Boolean {

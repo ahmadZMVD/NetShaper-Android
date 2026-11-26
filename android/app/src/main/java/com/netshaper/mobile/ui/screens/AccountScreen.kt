@@ -204,20 +204,32 @@ fun AccountScreen(
                             }
                         }
                         if (accountState.isPollingDeviceAuth) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(14.dp),
-                                    strokeWidth = 2.dp,
-                                    color = NetShaperColors.Emerald
-                                )
-                                Text(
-                                    text = "Waiting for GitHub authorization...",
-                                    fontSize = 11.sp,
-                                    color = NetShaperColors.TextSecondary
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(14.dp),
+                                        strokeWidth = 2.dp,
+                                        color = NetShaperColors.Emerald
+                                    )
+                                    Text(
+                                        text = "Waiting for GitHub authorization...",
+                                        fontSize = 11.sp,
+                                        color = NetShaperColors.TextSecondary
+                                    )
+                                }
+                                accountState.deviceAuthStatusNote?.let { note ->
+                                    Text(
+                                        text = note,
+                                        fontSize = 10.sp,
+                                        color = NetShaperColors.Amber
+                                    )
+                                }
                             }
                         }
                     }
@@ -228,7 +240,7 @@ fun AccountScreen(
                             onValueChange = { clientIdInput = it },
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true,
-                            placeholder = { Text("Optional GitHub OAuth Client ID", fontSize = 12.sp) },
+                            placeholder = { Text("GitHub OAuth Client ID (178c6fc778ccc68e1d6a)", fontSize = 12.sp) },
                             colors = glassTextFieldColors(),
                             shape = RoundedCornerShape(10.dp)
                         )
@@ -248,9 +260,9 @@ fun AccountScreen(
                     }
                 }
 
-                // Option B: Personal Access Token (Fastest Setup)
+                // Option B: Direct Token Entry
                 Text(
-                    text = "Option B · Personal Access Token (Fastest Setup)",
+                    text = "Option B · Direct GitHub Token (Prefer Option A if unsure)",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = NetShaperColors.TextPrimary
@@ -267,7 +279,7 @@ fun AccountScreen(
                             modifier = Modifier.weight(1f),
                             singleLine = true,
                             visualTransformation = PasswordVisualTransformation(),
-                            placeholder = { Text("ghp_... (codespace scope)", fontSize = 12.sp) },
+                            placeholder = { Text("gho_... or ghp_... (codespace scope)", fontSize = 12.sp) },
                             colors = glassTextFieldColors(),
                             shape = RoundedCornerShape(10.dp)
                         )
