@@ -22,16 +22,32 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Go 1.26.x matches go.mod requirements of golang.org/x/crypto/x509roots/fallback & golang.org/x/mobile@latest.
       - name: Set up Go 1.26
         uses: actions/setup-go@v5
         with:
           go-version: '1.26.0'
 
-      - name: Set up Android SDK, Platform 35, Build-Tools 35 & NDK 26.3
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android 15 Platform 35, Build-Tools 35.0.0 & NDK 26.3
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.3.11579264"
+      - name: Configure Preinstalled Android SDK & Install Platform 35, Build-Tools 35.0.0 & NDK 26.3
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          fi
+          echo "Using sdkmanager: $SDKMANAGER (SDK_ROOT=$SDK_ROOT)"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;26.3.11579264"
+          NDK_DIR="$SDK_ROOT/ndk/26.3.11579264"
+          test -d "$NDK_DIR"
+          {
+            echo "ANDROID_HOME=$SDK_ROOT"
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
+            echo "ANDROID_NDK_HOME=$NDK_DIR"
+          } >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
 
       - name: Gate 1 — Verify Untouched Windows v7.0 Zero-Regression
         run: python3 verify_static.py
@@ -50,7 +66,6 @@ jobs:
       - name: Gate 4 — Build 16KB-Aligned Multi-ABI netshaper-core.aar (arm64, arm, amd64)
         working-directory: mobilecore
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
           CGO_ENABLED: '1'
           CGO_LDFLAGS: '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'
         run: |
