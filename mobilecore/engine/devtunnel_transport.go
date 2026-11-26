@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -31,6 +33,7 @@ const (
 	startSSHServerGRPCPath    = "/Codespaces.Grpc.SshServerHostService.v1.SshServerHost/StartRemoteServerAsync"
 	devTunnelWSProtoV1        = "tunnel-relay-client"
 	devTunnelWSProtoV2        = "tunnel-relay-client-v2"
+	devTunnelWSProtoV2Dev     = "tunnel-relay-client-v2-dev"
 	devTunnelV2StreamChanType = "client-ssh-session-stream"
 )
 
@@ -119,12 +122,12 @@ func (h *HeartbeatCoordinator) Close() {
 
 // DevTunnelSSHTransport implements the complete pure-Go Codespaces Dev Tunnels wire stack:
 //  1. Singleflight CredentialManager -> GitHub Codespaces API (TunnelProperties JWT)
-//  2. Dev Tunnels REST API GET /api/v1/tunnels/{id} -> clientRelayUri + hostPublicKeys
-//  3. Dual-stack AntiPoisonResolver TCP + TLS + WebSocket (supports BOTH v1 & v2 subprotocols)
+//  2. Dev Tunnels REST API GET /tunnels/{id}?includePorts=true&api-version=... -> clientRelayUri + hostPublicKeys
+//  3. Dual-stack AntiPoisonResolver TCP + TLS + WebSocket (`tunnel-relay-client` v1 for production, plus v2 for loopback tests)
 //     with <= 8 KiB chunked binary framing when PMTU=576 VIP (20.120.56.11 / NAT64) is detected
 //  4. Outer Dev Tunnels SSH (ssh.NewClientConn directly, accepting host `tcpip-forward` requests)
 //  5. Zero-grpc h2c HTTP/2 unary protobuf RPC on port 16634 (`StartRemoteServerAsync`) with ephemeral Ed25519 keypair
-//  6. Ensure <sshdPort> registered via PUT .../ports/{port} + `RefreshPorts` when needed
+//  6. Ensure <sshdPort> registered via PUT /tunnels/{id}/ports/{port} + `RefreshPorts` when needed
 //  7. Inner `x/crypto/ssh` session with arch-optimal ciphers, `direct-tcpip` remote DNS, and keepalive watchdog.
 type DevTunnelSSHTransport struct {
 	cfg          Config
@@ -158,6 +161,17 @@ func NewDevTunnelSSHTransport(cfg Config, creds *CredentialManager, resolver *An
 	}
 }
 
+func (t *DevTunnelSSHTransport) logStage(workerID, stage, detail string) {
+	if t == nil || t.logger == nil {
+		return
+	}
+	t.logger.Log("WORKER_BOOT_STAGE", map[string]any{
+		"tunnel_id": workerID,
+		"stage":     stage,
+		"detail":    RedactSecrets(detail),
+	})
+}
+
 type devTunnelRESTDoc struct {
 	TunnelID  string `json:"tunnelId"`
 	ClusterID string `json:"clusterId"`
@@ -169,13 +183,63 @@ type devTunnelRESTDoc struct {
 	} `json:"endpoints"`
 	Ports []struct {
 		PortNumber uint16 `json:"portNumber"`
+		Protocol   string `json:"protocol"`
 	} `json:"ports"`
 }
 
-func normalizeDevTunnelsAPIBase(serviceURI string) string {
+// normalizeDevTunnelsAPIBase normalizes ServiceURI per microsoft/dev-tunnels `Manager.buildUri`:
+// canonical service routes live at `/tunnels/{id}` (NOT `/api/v1/tunnels/{id}` which returns HTTP 405
+// with api-version=2023-09-27-preview), and `global.*` hosts route to `<clusterId>.*` when known.
+func normalizeDevTunnelsAPIBase(serviceURI, clusterID string) string {
 	s := strings.TrimRight(strings.TrimSpace(serviceURI), "/")
 	s = strings.TrimSuffix(s, "/api/v1")
-	return s + "/api/v1"
+	s = strings.TrimRight(s, "/")
+	if s == "" {
+		return ""
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return s
+	}
+	clusterID = strings.TrimSpace(clusterID)
+	hostname := u.Hostname()
+	port := u.Port()
+	if clusterID != "" &&
+		hostname != "localhost" &&
+		hostname != "127.0.0.1" &&
+		hostname != "::1" &&
+		hostname != "tunnels.local.api.visualstudio.com" &&
+		!strings.HasPrefix(strings.ToLower(hostname), strings.ToLower(clusterID)+".") {
+		newHost := clusterID + "." + hostname
+		newHost = strings.Replace(newHost, "global.", "", 1)
+		if port != "" {
+			u.Host = net.JoinHostPort(newHost, port)
+		} else {
+			u.Host = newHost
+		}
+	}
+	cleanPath := strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/api/v1")
+	u.Path = strings.TrimRight(cleanPath, "/")
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+func isLoopbackRelayURI(rawURI string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURI))
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return strings.EqualFold(u.Scheme, "ws") && (h == "127.0.0.1" || h == "localhost" || h == "::1")
+}
+
+func safeURIHost(rawURI string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURI))
+	if err != nil || u.Host == "" {
+		return "<invalid>"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 func (t *DevTunnelSSHTransport) newDirectHTTPClient() *http.Client {
@@ -195,8 +259,11 @@ func (t *DevTunnelSSHTransport) newDirectHTTPClient() *http.Client {
 }
 
 func (t *DevTunnelSSHTransport) fetchDevTunnel(ctx context.Context, props TunnelProperties) (devTunnelRESTDoc, int, error) {
-	base := normalizeDevTunnelsAPIBase(props.ServiceURI)
-	u := fmt.Sprintf("%s/tunnels/%s?includePorts=true&api-version=%s", base, props.TunnelID, devTunnelsAPIVersion)
+	if strings.TrimSpace(props.ServiceURI) == "" {
+		return devTunnelRESTDoc{}, 0, errors.New("devtunnels serviceUri is empty")
+	}
+	base := normalizeDevTunnelsAPIBase(props.ServiceURI, props.ClusterID)
+	u := fmt.Sprintf("%s/tunnels/%s?includePorts=true&api-version=%s", base, url.PathEscape(props.TunnelID), devTunnelsAPIVersion)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return devTunnelRESTDoc{}, 0, err
@@ -216,7 +283,7 @@ func (t *DevTunnelSSHTransport) fetchDevTunnel(ctx context.Context, props Tunnel
 		return devTunnelRESTDoc{}, resp.StatusCode, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return devTunnelRESTDoc{}, resp.StatusCode, fmt.Errorf("devtunnels GET HTTP %d: %s", resp.StatusCode, RedactSecrets(string(raw)))
+		return devTunnelRESTDoc{}, resp.StatusCode, fmt.Errorf("devtunnels GET %s HTTP %d: %s", safeURIHost(base), resp.StatusCode, RedactSecrets(string(raw)))
 	}
 	var doc devTunnelRESTDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
@@ -225,20 +292,36 @@ func (t *DevTunnelSSHTransport) fetchDevTunnel(ctx context.Context, props Tunnel
 	return doc, resp.StatusCode, nil
 }
 
-func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props TunnelProperties, port uint16) error {
+func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props TunnelProperties, clusterFallback string, port uint16) error {
 	tok := props.ManagePortsAccessToken
 	if tok == "" {
 		tok = props.ConnectAccessToken
 	}
-	base := normalizeDevTunnelsAPIBase(props.ServiceURI)
-	u := fmt.Sprintf("%s/tunnels/%s/ports/%d?api-version=%s", base, props.TunnelID, port, devTunnelsAPIVersion)
-	payload := fmt.Sprintf(`{"portNumber":%d,"protocol":"auto"}`, port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, strings.NewReader(payload))
+	cluster := props.ClusterID
+	if cluster == "" {
+		cluster = clusterFallback
+	}
+	base := normalizeDevTunnelsAPIBase(props.ServiceURI, cluster)
+	u := fmt.Sprintf("%s/tunnels/%s/ports/%d?api-version=%s", base, url.PathEscape(props.TunnelID), port, devTunnelsAPIVersion)
+	payload, err := json.Marshal(struct {
+		PortNumber uint16   `json:"portNumber"`
+		Protocol   string   `json:"protocol"`
+		Labels     []string `json:"labels,omitempty"`
+	}{
+		PortNumber: port,
+		Protocol:   "http",
+		Labels:     []string{"InternalPort"},
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "tunnel "+tok)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("If-None-Match", "*")
 	req.Header.Set("User-Agent", "NetShaper-Mobile/7.0")
 
 	hc := t.newDirectHTTPClient()
@@ -247,11 +330,13 @@ func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props T
 		return err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == http.StatusConflict {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if (resp.StatusCode >= 200 && resp.StatusCode < 300) ||
+		resp.StatusCode == http.StatusConflict ||
+		resp.StatusCode == http.StatusPreconditionFailed {
 		return nil
 	}
-	return fmt.Errorf("devtunnels PUT port %d HTTP %d", port, resp.StatusCode)
+	return fmt.Errorf("devtunnels PUT port %d HTTP %d: %s", port, resp.StatusCode, RedactSecrets(strings.TrimSpace(string(body))))
 }
 
 func preferredInnerSSHCiphers() []string {
@@ -271,7 +356,7 @@ func preferredInnerSSHCiphers() []string {
 	}
 }
 
-func buildOuterHostKeyCallback(hostKeys []string) ssh.HostKeyCallback {
+func buildOuterHostKeyCallback(hostKeys []string) (ssh.HostKeyCallback, int) {
 	var parsed []ssh.PublicKey
 	for _, raw := range hostKeys {
 		raw = strings.TrimSpace(raw)
@@ -282,12 +367,26 @@ func buildOuterHostKeyCallback(hostKeys []string) ssh.HostKeyCallback {
 			parsed = append(parsed, pk)
 			continue
 		}
+		// Upstream Microsoft Dev Tunnels encodes `hostPublicKeys` as raw Base64 of SSH wire key bytes.
+		matchedB64 := false
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
+			if wire, derr := enc.DecodeString(raw); derr == nil && len(wire) > 0 {
+				if pk, err := ssh.ParsePublicKey(wire); err == nil {
+					parsed = append(parsed, pk)
+					matchedB64 = true
+					break
+				}
+			}
+		}
+		if matchedB64 {
+			continue
+		}
 		if pk, err := ssh.ParsePublicKey([]byte(raw)); err == nil {
 			parsed = append(parsed, pk)
 		}
 	}
 	if len(parsed) == 0 {
-		return ssh.InsecureIgnoreHostKey()
+		return ssh.InsecureIgnoreHostKey(), 0
 	}
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
 		got := key.Marshal()
@@ -297,47 +396,56 @@ func buildOuterHostKeyCallback(hostKeys []string) ssh.HostKeyCallback {
 			}
 		}
 		return fmt.Errorf("outer devtunnel host key mismatch (type=%s)", key.Type())
-	}
+	}, len(parsed)
 }
 
 // Connect establishes a brand-new independent outer WAN TCP + TLS + WSS + Outer SSH + Inner SSH session.
 func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (WorkerSession, error) {
+	t.logStage(workerID, "1/7", "resolving codespace DevTunnels JWT")
 	props, err := t.creds.Get(ctx, false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("[1/7 codespace creds] %w", err)
 	}
+	t.logStage(workerID, "1/7", fmt.Sprintf("tunnel_id=%s cluster=%s", props.TunnelID, props.ClusterID))
+
+	t.logStage(workerID, "2/7", fmt.Sprintf("GET %s/tunnels", safeURIHost(normalizeDevTunnelsAPIBase(props.ServiceURI, props.ClusterID))))
 	doc, status, err := t.fetchDevTunnel(ctx, props)
 	if err != nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
+		t.logStage(workerID, "2/7", fmt.Sprintf("HTTP %d from DevTunnels REST, invalidating JWT & refreshing", status))
 		t.creds.Invalidate()
 		props, err = t.creds.Get(ctx, true)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("[2/7 devtunnel jwt refresh] %w", err)
 		}
 		doc, _, err = t.fetchDevTunnel(ctx, props)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("[2/7 devtunnel GET] %w", err)
 	}
 
 	var relayURI string
 	var hostPubKeys []string
+	var epMode string
 	for _, ep := range doc.Endpoints {
 		if strings.EqualFold(ep.ConnectionMode, "TunnelRelay") && ep.ClientRelayURI != "" {
 			relayURI = ep.ClientRelayURI
 			hostPubKeys = ep.HostPublicKeys
+			epMode = ep.ConnectionMode
 			break
 		}
 	}
 	if relayURI == "" && len(doc.Endpoints) > 0 {
 		relayURI = doc.Endpoints[0].ClientRelayURI
 		hostPubKeys = doc.Endpoints[0].HostPublicKeys
+		epMode = doc.Endpoints[0].ConnectionMode
 	}
 	if relayURI == "" {
-		return nil, errors.New("devtunnels endpoint missing clientRelayUri")
+		return nil, errors.New("[2/7 devtunnel GET] endpoint missing clientRelayUri")
 	}
 	if len(hostPubKeys) == 0 {
 		hostPubKeys = props.HostPublicKeys
 	}
+	t.logStage(workerID, "2/7", fmt.Sprintf("mode=%s endpoints=%d ports=%d relay=%s", epMode, len(doc.Endpoints), len(doc.Ports), safeURIHost(relayURI)))
 
 	// 1. Dial WebSocket Relay via custom dual-stack AntiPoisonResolver capturing exact WAN remote IP.
 	var wanRemoteAtomic atomic.Value
@@ -359,16 +467,24 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 	hdr.Set("Authorization", "tunnel "+props.ConnectAccessToken)
 	hdr.Set("User-Agent", "NetShaper-Mobile/7.0")
 
+	subprotocols := []string{devTunnelWSProtoV1}
+	if isLoopbackRelayURI(relayURI) {
+		subprotocols = []string{devTunnelWSProtoV1, devTunnelWSProtoV2}
+	}
 	wsConn, wsResp, err := websocket.Dial(ctx, relayURI, &websocket.DialOptions{
 		HTTPClient:   wsHTTP,
 		HTTPHeader:   hdr,
-		Subprotocols: []string{devTunnelWSProtoV1, devTunnelWSProtoV2},
+		Subprotocols: subprotocols,
 	})
 	if err != nil {
 		if wsResp != nil && (wsResp.StatusCode == http.StatusUnauthorized || wsResp.StatusCode == http.StatusForbidden) {
 			t.creds.Invalidate()
 		}
-		return nil, fmt.Errorf("devtunnel wss dial: %w", err)
+		httpCode := 0
+		if wsResp != nil {
+			httpCode = wsResp.StatusCode
+		}
+		return nil, fmt.Errorf("[3/7 wss dial http=%d] %w", httpCode, err)
 	}
 	wsConn.SetReadLimit(-1) // Disable 32 KiB default read limit so full SSH packets never drop.
 
@@ -378,6 +494,7 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 	if pmtu576 && t.cfg.PMTU576CopyBufSize > 0 {
 		maxChunk = t.cfg.PMTU576CopyBufSize
 	}
+	t.logStage(workerID, "3/7", fmt.Sprintf("wss connected subproto=%s wan=%s pmtu576=%v", wsConn.Subprotocol(), wanRemote, pmtu576))
 
 	// Long-lived session context (decoupled from short boot ctx once Connect succeeds!).
 	// During boot, bind ctx cancellation directly to wsNetConn.Close() so SSH/RefreshPorts stalls abort in <50ms.
@@ -402,11 +519,11 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 		}
 	}
 
-	// 2. Support BOTH v1 (direct Host SSH) AND v2 (relay SSH -> client-ssh-session-stream -> Host SSH).
+	// 2. Support v1 (direct Host SSH) in production AND v2 on loopback test relays.
 	var hostTransport net.Conn = wsNetConn
 	var relaySSHConn ssh.Conn
 	subproto := wsConn.Subprotocol()
-	if strings.HasPrefix(subproto, devTunnelWSProtoV2) {
+	if strings.HasPrefix(subproto, devTunnelWSProtoV2) && isLoopbackRelayURI(relayURI) {
 		rConn, rChans, rReqs, rErr := ssh.NewClientConn(wsNetConn, relayURI, &ssh.ClientConfig{
 			User:            "tunnel",
 			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -414,7 +531,7 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 		})
 		if rErr != nil {
 			cleanupOnErr(wsNetConn)
-			return nil, fmt.Errorf("devtunnel v2 relay ssh: %w", rErr)
+			return nil, fmt.Errorf("[3/7 v2 relay ssh] %w", rErr)
 		}
 		relaySSHConn = rConn
 		safeGo(t.logger, workerID+"_v2_reqs", func() { ssh.DiscardRequests(rReqs) })
@@ -426,23 +543,25 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 		streamCh, streamReqs, chErr := rConn.OpenChannel(devTunnelV2StreamChanType, nil)
 		if chErr != nil {
 			cleanupOnErr(relaySSHConn, wsNetConn)
-			return nil, fmt.Errorf("devtunnel v2 open %s: %w", devTunnelV2StreamChanType, chErr)
+			return nil, fmt.Errorf("[3/7 v2 open %s] %w", devTunnelV2StreamChanType, chErr)
 		}
 		safeGo(t.logger, workerID+"_v2_stream_reqs", func() { ssh.DiscardRequests(streamReqs) })
 		hostTransport = NewDeadlineSSHConn(streamCh, "devtunnel-v2-host")
 	}
 
 	// 3. Outer Dev Tunnels SSH session — MUST use ssh.NewClientConn directly so we accept host `tcpip-forward`!
+	hostKeyCB, verifiedKeys := buildOuterHostKeyCallback(hostPubKeys)
 	outerCfg := &ssh.ClientConfig{
 		User:            "tunnel",
-		HostKeyCallback: buildOuterHostKeyCallback(hostPubKeys),
+		HostKeyCallback: hostKeyCB,
 		Timeout:         15 * time.Second,
 	}
 	outerConn, outerChans, outerReqs, err := ssh.NewClientConn(hostTransport, relayURI, outerCfg)
 	if err != nil {
 		cleanupOnErr(hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("devtunnel outer ssh: %w", err)
+		return nil, fmt.Errorf("[4/7 outer ssh] %w", err)
 	}
+	t.logStage(workerID, "4/7", fmt.Sprintf("outer ssh connected (host_keys=%d)", verifiedKeys))
 
 	outer := &outerDevTunnelSSH{
 		conn:           outerConn,
@@ -456,43 +575,65 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 		}
 	})
 
-	// Wait briefly for host to advertise port 16634 via tcpip-forward (or request RefreshPorts).
-	if !outer.waitForPort(ctx, codespaceRPCPort, 1200*time.Millisecond) {
+	// Wait for host to advertise port 16634 via tcpip-forward (or request RefreshPorts).
+	rpcReady := outer.waitForPort(ctx, codespaceRPCPort, 2500*time.Millisecond)
+	if !rpcReady {
 		_, _, _ = outerConn.SendRequest("RefreshPorts", true, nil)
-		_ = outer.waitForPort(ctx, codespaceRPCPort, 1200*time.Millisecond)
+		rpcReady = outer.waitForPort(ctx, codespaceRPCPort, 5000*time.Millisecond)
 	}
+	t.logStage(workerID, "4/7", fmt.Sprintf("port 16634 advertised=%v", rpcReady))
 
 	// 4. Generate ephemeral RAM-only Ed25519 keypair (never written to disk!).
 	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		cleanupOnErr(outerConn, hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("generate ephemeral ed25519: %w", err)
+		return nil, fmt.Errorf("[5/7 keygen] %w", err)
 	}
 	signer, err := ssh.NewSignerFromKey(privKey)
 	if err != nil {
 		cleanupOnErr(outerConn, hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("ssh signer: %w", err)
+		return nil, fmt.Errorf("[5/7 signer] %w", err)
 	}
 	sshPub, err := ssh.NewPublicKey(pubKey)
 	if err != nil {
 		cleanupOnErr(outerConn, hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("ssh pubkey: %w", err)
+		return nil, fmt.Errorf("[5/7 pubkey] %w", err)
 	}
 	pubKeyLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub)))
 
-	// 5. Invoke zero-grpc h2c HTTP/2 StartRemoteServerAsync on port 16634.
+	// 5. Invoke zero-grpc h2c HTTP/2 StartRemoteServerAsync on port 16634 (with 1 cold-start retry).
 	sshdPort, sshUser, err := invokeStartSSHServerH2C(ctx, func(dctx context.Context) (net.Conn, error) {
 		return outer.openPortStream(dctx, codespaceRPCPort)
 	}, pubKeyLine)
+	if err != nil && ctx.Err() == nil {
+		t.logStage(workerID, "5/7", fmt.Sprintf("StartRemoteServerAsync retry after transient error: %s", err.Error()))
+		retryWait := 1500 * time.Millisecond
+		if isLoopbackRelayURI(relayURI) {
+			retryWait = 40 * time.Millisecond
+		}
+		tm := time.NewTimer(retryWait)
+		select {
+		case <-ctx.Done():
+			tm.Stop()
+		case <-tm.C:
+			_, _, _ = outerConn.SendRequest("RefreshPorts", true, nil)
+			_ = outer.waitForPort(ctx, codespaceRPCPort, 2000*time.Millisecond)
+			sshdPort, sshUser, err = invokeStartSSHServerH2C(ctx, func(dctx context.Context) (net.Conn, error) {
+				return outer.openPortStream(dctx, codespaceRPCPort)
+			}, pubKeyLine)
+		}
+	}
 	if err != nil {
 		cleanupOnErr(outerConn, hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("codespace rpc StartRemoteServerAsync: %w", err)
+		return nil, fmt.Errorf("[5/7 rpc StartRemoteServerAsync] %w", err)
 	}
 	if sshUser == "" {
 		sshUser = "codespace"
 	}
+	t.logStage(workerID, "5/7", fmt.Sprintf("StartRemoteServerAsync ok sshd_port=%d user=%s", sshdPort, sshUser))
 
 	// 6. Ensure <sshdPort> is exposed on the Dev Tunnel and advertised via RefreshPorts.
+	var putErr error
 	if !outer.hasPort(uint32(sshdPort)) {
 		portInDoc := false
 		for _, p := range doc.Ports {
@@ -502,17 +643,26 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 			}
 		}
 		if !portInDoc {
-			_ = t.ensureDevTunnelPort(ctx, props, sshdPort)
+			putErr = t.ensureDevTunnelPort(ctx, props, doc.ClusterID, sshdPort)
+			if putErr != nil {
+				t.logStage(workerID, "6/7", fmt.Sprintf("PUT port %d warning: %s", sshdPort, putErr.Error()))
+			}
 		}
 		_, _, _ = outerConn.SendRequest("RefreshPorts", true, nil)
-		_ = outer.waitForPort(ctx, uint32(sshdPort), 2500*time.Millisecond)
+		sshdAdvertised := outer.waitForPort(ctx, uint32(sshdPort), 6000*time.Millisecond)
+		t.logStage(workerID, "6/7", fmt.Sprintf("sshd port %d exposed advertised=%v", sshdPort, sshdAdvertised))
+	} else {
+		t.logStage(workerID, "6/7", fmt.Sprintf("sshd port %d already forwarded", sshdPort))
 	}
 
 	// 7. Open stream to <sshdPort> over Outer SSH and establish Inner Codespace SSH session.
 	sshdStream, err := outer.openPortStream(ctx, uint32(sshdPort))
 	if err != nil {
 		cleanupOnErr(outerConn, hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("open sshd port %d: %w", sshdPort, err)
+		if putErr != nil {
+			return nil, fmt.Errorf("[6/7 expose+open sshd port %d] open=%w (put=%v)", sshdPort, err, putErr)
+		}
+		return nil, fmt.Errorf("[7/7 open sshd port %d] %w", sshdPort, err)
 	}
 
 	innerCfg := &ssh.ClientConfig{
@@ -529,9 +679,10 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 	innerConn, innerChans, innerReqs, err := ssh.NewClientConn(sshdStream, fmt.Sprintf("codespace-sshd:%d", sshdPort), innerCfg)
 	if err != nil {
 		cleanupOnErr(sshdStream, outerConn, hostTransport, relaySSHConn, wsNetConn)
-		return nil, fmt.Errorf("inner sshd handshake (user=%s port=%d): %w", sshUser, sshdPort, err)
+		return nil, fmt.Errorf("[7/7 inner sshd handshake user=%s port=%d] %w", sshUser, sshdPort, err)
 	}
 	innerClient := ssh.NewClient(innerConn, innerChans, innerReqs)
+	t.logStage(workerID, "7/7", fmt.Sprintf("inner ssh ready user=%s port=%d", sshUser, sshdPort))
 
 	if !stopBootWatch() {
 		_ = innerClient.Close()
@@ -629,11 +780,7 @@ func (o *outerDevTunnelSSH) handleGlobalRequests(reqs <-chan *ssh.Request) {
 				default:
 				}
 				if req.WantReply {
-					if p.BindPort == 0 {
-						_ = req.Reply(true, ssh.Marshal(struct{ Port uint32 }{0}))
-					} else {
-						_ = req.Reply(true, nil)
-					}
+					_ = req.Reply(true, ssh.Marshal(struct{ Port uint32 }{p.BindPort}))
 				}
 			} else if req.WantReply {
 				_ = req.Reply(false, nil)
@@ -705,6 +852,15 @@ func (o *outerDevTunnelSSH) openPortStream(ctx context.Context, port uint32) (ne
 			OriginPort:    0,
 		})
 		ch, reqs, err := o.conn.OpenChannel("forwarded-tcpip", payload)
+		if err != nil && bindAddr != "127.0.0.1" {
+			fallbackPayload := ssh.Marshal(forwardedTCPIPPayload{
+				ConnectedAddr: "127.0.0.1",
+				ConnectedPort: port,
+				OriginAddr:    "127.0.0.1",
+				OriginPort:    0,
+			})
+			ch, reqs, err = o.conn.OpenChannel("forwarded-tcpip", fallbackPayload)
+		}
 		if err != nil {
 			var openErr *ssh.OpenChannelError
 			if errors.As(err, &openErr) && openErr.Reason == ssh.UnknownChannelType {
@@ -1061,6 +1217,7 @@ func invokeStartSSHServerH2C(ctx context.Context, dialStream func(context.Contex
 	if err != nil {
 		return 0, "", err
 	}
+	req.Header.Set("Authorization", "Bearer token")
 	req.Header.Set("Content-Type", "application/grpc")
 	req.Header.Set("TE", "trailers")
 	req.Header.Set("Grpc-Timeout", "20S")

@@ -11,20 +11,98 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 // TunnelProperties holds Microsoft Dev Tunnels credentials returned by GitHub Codespaces API.
+// GitHub's live GET /user/codespaces/{name}?internal=true endpoint emits camelCase keys under
+// `connection.tunnelProperties` (see cli/cli internal/codespaces/api/api.go); UnmarshalJSON also
+// accepts snake_case aliases for full backward compatibility with mock fixtures.
 type TunnelProperties struct {
-	ConnectAccessToken     string   `json:"connect_access_token"`
-	ManagePortsAccessToken string   `json:"manage_ports_access_token"`
-	ServiceURI             string   `json:"service_uri"`
-	TunnelID               string   `json:"tunnel_id"`
-	ClusterID              string   `json:"cluster_id"`
+	ConnectAccessToken     string   `json:"connectAccessToken"`
+	ManagePortsAccessToken string   `json:"managePortsAccessToken"`
+	ServiceURI             string   `json:"serviceUri"`
+	TunnelID               string   `json:"tunnelId"`
+	ClusterID              string   `json:"clusterId"`
 	Domain                 string   `json:"domain"`
-	HostPublicKeys         []string `json:"host_public_keys,omitempty"`
+	HostPublicKeys         []string `json:"hostPublicKeys,omitempty"`
+}
+
+func pickJSONField(m map[string]json.RawMessage, keys ...string) (json.RawMessage, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && len(v) > 0 && string(v) != "null" {
+			return v, true
+		}
+	}
+	for mk, v := range m {
+		if len(v) == 0 || string(v) == "null" {
+			continue
+		}
+		for _, k := range keys {
+			if strings.EqualFold(mk, k) {
+				return v, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func decodeJSONString(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return ""
+}
+
+func sortedMapKeys(m map[string]json.RawMessage) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (p *TunnelProperties) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(bytes.TrimSpace(data)) == "null" {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	if v, ok := pickJSONField(m, "connectAccessToken", "connect_access_token"); ok {
+		p.ConnectAccessToken = decodeJSONString(v)
+	}
+	if v, ok := pickJSONField(m, "managePortsAccessToken", "manage_ports_access_token"); ok {
+		p.ManagePortsAccessToken = decodeJSONString(v)
+	}
+	if v, ok := pickJSONField(m, "serviceUri", "service_uri"); ok {
+		p.ServiceURI = decodeJSONString(v)
+	}
+	if v, ok := pickJSONField(m, "tunnelId", "tunnel_id"); ok {
+		p.TunnelID = decodeJSONString(v)
+	}
+	if v, ok := pickJSONField(m, "clusterId", "cluster_id"); ok {
+		p.ClusterID = decodeJSONString(v)
+	}
+	if v, ok := pickJSONField(m, "domain"); ok {
+		p.Domain = decodeJSONString(v)
+	}
+	if v, ok := pickJSONField(m, "hostPublicKeys", "host_public_keys"); ok {
+		var hk []string
+		if err := json.Unmarshal(v, &hk); err == nil {
+			p.HostPublicKeys = hk
+		}
+	}
+	return nil
 }
 
 type CodespaceMachine struct {
@@ -44,6 +122,24 @@ type CodespaceSummary struct {
 	Machine     CodespaceMachine `json:"machine"`
 }
 
+type CodespaceConnection struct {
+	TunnelProperties TunnelProperties `json:"tunnelProperties"`
+}
+
+func (c *CodespaceConnection) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(bytes.TrimSpace(data)) == "null" {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	if v, ok := pickJSONField(m, "tunnelProperties", "tunnel_properties"); ok {
+		return json.Unmarshal(v, &c.TunnelProperties)
+	}
+	return nil
+}
+
 type CodespaceDetail struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
@@ -54,10 +150,39 @@ type CodespaceDetail struct {
 	Repository struct {
 		FullName string `json:"full_name"`
 	} `json:"repository"`
-	Machine    CodespaceMachine `json:"machine"`
-	Connection struct {
-		TunnelProperties TunnelProperties `json:"tunnel_properties"`
-	} `json:"connection"`
+	Machine           CodespaceMachine    `json:"machine"`
+	Connection        CodespaceConnection `json:"connection"`
+	RawDiagnosticKeys string              `json:"-"`
+}
+
+func (d *CodespaceDetail) UnmarshalJSON(data []byte) error {
+	type codespaceDetailAlias CodespaceDetail
+	var alias codespaceDetailAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*d = CodespaceDetail(alias)
+
+	// Capture only JSON structural key names (never secret values) for safe Terminal diagnostics.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err == nil {
+		var connKeys []string
+		var propKeys []string
+		if rawConn, ok := pickJSONField(top, "connection"); ok {
+			var cm map[string]json.RawMessage
+			if err := json.Unmarshal(rawConn, &cm); err == nil {
+				connKeys = sortedMapKeys(cm)
+				if rawProps, ok2 := pickJSONField(cm, "tunnelProperties", "tunnel_properties"); ok2 {
+					var pm map[string]json.RawMessage
+					if err := json.Unmarshal(rawProps, &pm); err == nil {
+						propKeys = sortedMapKeys(pm)
+					}
+				}
+			}
+		}
+		d.RawDiagnosticKeys = fmt.Sprintf("conn_keys=%v prop_keys=%v", connKeys, propKeys)
+	}
+	return nil
 }
 
 type DeviceAuthStartResponse struct {
@@ -148,7 +273,7 @@ func NewGitHubAPIClient(apiBaseURL, oauthBaseURL string, resolver *AntiPoisonRes
 		oauthBaseURL: strings.TrimRight(oauthBaseURL, "/"),
 		httpClient:   &http.Client{Transport: tr, Timeout: 30 * time.Second},
 		guard:        guard,
-		coldPollWait: []time.Duration{12 * time.Second, 10 * time.Second, 15 * time.Second},
+		coldPollWait: []time.Duration{18 * time.Second, 20 * time.Second, 25 * time.Second},
 	}
 }
 
@@ -183,6 +308,9 @@ func (c *GitHubAPIClient) doJSON(ctx context.Context, method, fullURL, token str
 	}
 	req.Header.Set("User-Agent", "NetShaper-Mobile/7.0")
 	req.Header.Set("Accept", "application/vnd.github+json")
+	if !strings.Contains(fullURL, "/login/") {
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
 	}
@@ -346,6 +474,17 @@ func (c *GitHubAPIClient) StartCodespace(ctx context.Context, token, name string
 	if err != nil {
 		return CodespaceDetail{}, err
 	}
+	if status == http.StatusConflict {
+		// Benign 409 means another controller/caller already started the VM transition.
+		var detail CodespaceDetail
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, &detail)
+		}
+		if detail.State == "" {
+			detail.State = "Starting"
+		}
+		return detail, nil
+	}
 	if status < 200 || status >= 300 {
 		return CodespaceDetail{}, c.formatHTTPError(status, hdr, raw, "start codespace")
 	}
@@ -356,21 +495,69 @@ func (c *GitHubAPIClient) StartCodespace(ctx context.Context, token, name string
 	return detail, nil
 }
 
-// EnsureAvailableAndFetchTunnel performs adaptive cold-boot polling (strictly 3-4 API calls out of 6/5m budget)
+func hasCompleteTunnelProperties(d CodespaceDetail) bool {
+	p := d.Connection.TunnelProperties
+	return strings.TrimSpace(p.ConnectAccessToken) != "" &&
+		strings.TrimSpace(p.TunnelID) != "" &&
+		strings.TrimSpace(p.ServiceURI) != ""
+}
+
+// EnsureAvailableAndFetchTunnel performs adaptive cold-boot polling (strictly <=5 API calls out of 6/5m budget)
 // to wake a Shutdown Codespace and return fresh Dev Tunnels TunnelProperties.
 func (c *GitHubAPIClient) EnsureAvailableAndFetchTunnel(ctx context.Context, token, name string) (CodespaceDetail, error) {
 	detail, err := c.GetCodespaceConnection(ctx, token, name)
 	if err != nil {
 		return CodespaceDetail{}, err
 	}
-	if strings.EqualFold(detail.State, "Available") && detail.Connection.TunnelProperties.ConnectAccessToken != "" {
+	if strings.EqualFold(detail.State, "Available") && hasCompleteTunnelProperties(detail) {
 		return detail, nil
+	}
+
+	recheckDelay := 5 * time.Second
+	if len(c.coldPollWait) > 0 && c.coldPollWait[0] > 0 && c.coldPollWait[0] < recheckDelay {
+		recheckDelay = c.coldPollWait[0]
+	}
+
+	waitAndRecheckMissingProps := func(prev CodespaceDetail) (CodespaceDetail, error) {
+		tm := time.NewTimer(recheckDelay)
+		select {
+		case <-ctx.Done():
+			tm.Stop()
+			return CodespaceDetail{}, ctx.Err()
+		case <-tm.C:
+		}
+		next, gerr := c.GetCodespaceConnection(ctx, token, name)
+		if gerr != nil {
+			return CodespaceDetail{}, gerr
+		}
+		if strings.EqualFold(next.State, "Available") && hasCompleteTunnelProperties(next) {
+			return next, nil
+		}
+		diag := next.RawDiagnosticKeys
+		if diag == "" {
+			diag = prev.RawDiagnosticKeys
+		}
+		return next, &FatalBootError{
+			Code:    "missing_tunnel_props",
+			Message: fmt.Sprintf("Codespace %q is Available but GitHub API returned incomplete tunnelProperties (%s). Re-authorize via Option A (OAuth Device Flow) or verify codespace token scope.", name, diag),
+			Detail:  diag,
+		}
+	}
+
+	// If already Available on the first call yet tunnelProperties is empty/incomplete, perform one
+	// brief settle check and fail fast instead of looping until WAF 6/6 budget exhaustion.
+	if strings.EqualFold(detail.State, "Available") {
+		return waitAndRecheckMissingProps(detail)
 	}
 
 	lowState := strings.ToLower(strings.TrimSpace(detail.State))
 	if lowState == "shutdown" || lowState == "stopped" || lowState == "unavailable" {
-		if _, err := c.StartCodespace(ctx, token, name); err != nil {
-			return CodespaceDetail{}, err
+		startDetail, serr := c.StartCodespace(ctx, token, name)
+		if serr != nil {
+			return CodespaceDetail{}, serr
+		}
+		if strings.EqualFold(startDetail.State, "Available") && hasCompleteTunnelProperties(startDetail) {
+			return startDetail, nil
 		}
 	}
 
@@ -386,11 +573,14 @@ func (c *GitHubAPIClient) EnsureAvailableAndFetchTunnel(ctx context.Context, tok
 		if err != nil {
 			return CodespaceDetail{}, err
 		}
-		if strings.EqualFold(detail.State, "Available") && detail.Connection.TunnelProperties.ConnectAccessToken != "" {
-			return detail, nil
+		if strings.EqualFold(detail.State, "Available") {
+			if hasCompleteTunnelProperties(detail) {
+				return detail, nil
+			}
+			return waitAndRecheckMissingProps(detail)
 		}
 	}
-	return CodespaceDetail{}, fmt.Errorf("codespace %q did not reach Available state (last=%q)", name, detail.State)
+	return CodespaceDetail{}, fmt.Errorf("codespace %q did not reach Available state (last=%q %s)", name, detail.State, detail.RawDiagnosticKeys)
 }
 
 // StopCodespace issues POST /user/codespaces/{name}/stop.
@@ -599,6 +789,7 @@ type CredentialManager struct {
 	nowFn         func() time.Time
 
 	mu        sync.Mutex
+	logger    *EventLogger
 	cached    TunnelProperties
 	expiresAt time.Time
 	hasCached bool
@@ -621,6 +812,16 @@ func NewCredentialManager(api *GitHubAPIClient, token, codespaceName string) *Cr
 	}
 }
 
+// SetLogger binds an optional EventLogger for redacted schema/credential diagnostics.
+func (m *CredentialManager) SetLogger(logger *EventLogger) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.logger = logger
+	m.mu.Unlock()
+}
+
 // Invalidate clears the cached JWT (called when Dev Tunnels relay rejects with HTTP 401/403).
 func (m *CredentialManager) Invalidate() {
 	m.mu.Lock()
@@ -635,6 +836,7 @@ func (m *CredentialManager) Get(ctx context.Context, forceRefresh bool) (TunnelP
 	for {
 		m.mu.Lock()
 		now := m.nowFn()
+		logger := m.logger
 		if !forceRefresh && m.hasCached && now.Add(m.refreshMargin).Before(m.expiresAt) {
 			cp := m.cached
 			m.mu.Unlock()
@@ -661,8 +863,21 @@ func (m *CredentialManager) Get(ctx context.Context, forceRefresh bool) (TunnelP
 		var props TunnelProperties
 		if err == nil {
 			props = detail.Connection.TunnelProperties
-			if props.ConnectAccessToken == "" || props.TunnelID == "" {
-				err = errors.New("github codespace API returned empty tunnel_properties")
+			if !hasCompleteTunnelProperties(detail) {
+				err = &FatalBootError{
+					Code:    "missing_tunnel_props",
+					Message: fmt.Sprintf("Codespace %q is Available but GitHub API returned incomplete tunnelProperties (%s). Re-authorize via Option A (OAuth Device Flow).", m.codespaceName, detail.RawDiagnosticKeys),
+					Detail:  detail.RawDiagnosticKeys,
+				}
+			}
+		}
+		if err != nil && logger != nil {
+			var fatalErr *FatalBootError
+			if errors.As(err, &fatalErr) && fatalErr.Code == "missing_tunnel_props" {
+				logger.Log("GITHUB_TUNNEL_PROPS_MISSING", map[string]any{
+					"codespace": m.codespaceName,
+					"keys":      fatalErr.Detail,
+				})
 			}
 		}
 

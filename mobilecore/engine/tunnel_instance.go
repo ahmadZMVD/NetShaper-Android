@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"sync"
@@ -430,7 +431,11 @@ func (t *TunnelInstance) BootAndQualify(
 			return nil, BootQualityReport{}, err
 		}
 		bootStart := time.Now()
-		bootCtx, cancelBoot := context.WithTimeout(ctx, t.cfg.BootTimeout)
+		effBootTimeout := t.cfg.BootTimeout
+		if effBootTimeout >= 60*time.Second && effBootTimeout < 120*time.Second {
+			effBootTimeout = 120 * time.Second
+		}
+		bootCtx, cancelBoot := context.WithTimeout(ctx, effBootTimeout)
 		sess, err := t.transport.Connect(bootCtx, t.id)
 		cancelBoot()
 		if err != nil {
@@ -444,6 +449,13 @@ func (t *TunnelInstance) BootAndQualify(
 					})
 				}
 				return nil, BootQualityReport{}, fatalErr
+			}
+			if t.logger != nil && ctx.Err() == nil {
+				t.logger.Log("WORKER_BOOT_FAIL", map[string]any{
+					"tunnel_id":  t.id,
+					"elapsed_ms": time.Since(bootStart).Milliseconds(),
+					"error":      RedactSecrets(err.Error()),
+				})
 			}
 			return nil, BootQualityReport{}, err
 		}
@@ -472,6 +484,14 @@ func (t *TunnelInstance) BootAndQualify(
 			}
 			rtt, pErr := t.probeFn(ctx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
 			if pErr != nil {
+				if t.logger != nil && ctx.Err() == nil {
+					t.logger.Log("WORKER_PROBE_FAIL", map[string]any{
+						"tunnel_id": t.id,
+						"target":    t.cfg.ProbeTarget,
+						"sample":    i + 1,
+						"error":     RedactSecrets(pErr.Error()),
+					})
+				}
 				failures++
 				break
 			}
@@ -495,6 +515,14 @@ func (t *TunnelInstance) BootAndQualify(
 			microRTT, mpErr = t.microFn(ctx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
 			if mpErr != nil {
 				microOK = false
+				if t.logger != nil && ctx.Err() == nil {
+					t.logger.Log("WORKER_PROBE_FAIL", map[string]any{
+						"tunnel_id": t.id,
+						"target":    t.cfg.ProbeTarget,
+						"sample":    "micro_payload",
+						"error":     RedactSecrets(mpErr.Error()),
+					})
+				}
 			}
 		}
 
@@ -520,7 +548,22 @@ func (t *TunnelInstance) BootAndQualify(
 			}
 		}
 
-		if !qRep.Accepted && qualityRetries < t.cfg.BootQualityMaxRetries && (canRetry || qRep.Failures > 0 || !qRep.MicroPayloadOK) {
+		// Avoid tearing down a working sole cellular tunnel just because LTE->Codespace RTT exceeds
+		// local Iranian underlay RTT when no healthy peer exists to beat it.
+		soleCellularAccept := !qRep.Accepted &&
+			peerMedian == 0 &&
+			qRep.Failures == 0 &&
+			qRep.MicroPayloadOK &&
+			len(rtts) > 0 &&
+			qRep.Reason == "slow_lane_vs_underlay_baseline" &&
+			(t.cfg.BootQualityMaxRTT <= 0 || qRep.P50MS <= t.cfg.BootQualityMaxRTT.Milliseconds())
+
+		shouldRetryQuality := !qRep.Accepted &&
+			!soleCellularAccept &&
+			qualityRetries < t.cfg.BootQualityMaxRetries &&
+			(canRetry || qRep.Failures > 0 || !qRep.MicroPayloadOK)
+
+		if shouldRetryQuality {
 			qualityRetries++
 			if t.logger != nil {
 				t.logger.Log("BOOT_QUALITY_REJECT", map[string]any{
@@ -544,6 +587,11 @@ func (t *TunnelInstance) BootAndQualify(
 			continue
 		}
 
+		if qRep.Failures > 0 && len(rtts) == 0 {
+			_ = sess.Close()
+			return nil, BootQualityReport{}, fmt.Errorf("boot qualification failed: 0/%d probes succeeded (target=%s)", samples, t.cfg.ProbeTarget)
+		}
+
 		if !qRep.Accepted && t.logger != nil {
 			t.logger.Log("BOOT_QUALITY_ACCEPTED_BEST_EFFORT", map[string]any{
 				"tunnel_id":          t.id,
@@ -556,6 +604,14 @@ func (t *TunnelInstance) BootAndQualify(
 		}
 
 		t.setSession(sess)
+		if t.logger != nil {
+			t.logger.Log("WORKER_BOOT_OK", map[string]any{
+				"tunnel_id":  t.id,
+				"p50_ms":     qRep.P50MS,
+				"wan_remote": wan,
+				"pmtu576":    pmtu576,
+			})
+		}
 		if qRep.P50MS > 0 {
 			t.SetEWMARTT(time.Duration(qRep.P50MS) * time.Millisecond)
 		} else if len(rtts) > 0 {

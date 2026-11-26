@@ -375,6 +375,7 @@ func (c *SessionController) runSession() {
 
 	hb := NewHeartbeatCoordinator(time.Duration(c.cfg.SSHServerAliveInterval) * time.Second)
 	creds := NewCredentialManager(c.apiClient, c.cfg.GitHubToken, c.cfg.CodespaceName)
+	creds.SetLogger(eventLogger)
 
 	var transport WorkerTransport
 	if c.overrides.TransportFactory != nil {

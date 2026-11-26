@@ -1329,6 +1329,14 @@ func (p *TunnelPool) superviseWorker(ctx context.Context, idx int, w *TunnelInst
 			}
 			attempt++
 			backoff := ComputeBackoff(attempt, p.cfg.BackoffMin, p.cfg.BackoffMax, nil)
+			if p.logger != nil {
+				p.logger.Log("WORKER_BOOT_FAIL", map[string]any{
+					"tunnel_id":  w.id,
+					"attempt":    attempt,
+					"backoff_ms": backoff.Milliseconds(),
+					"error":      RedactSecrets(err.Error()),
+				})
+			}
 			tm := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():

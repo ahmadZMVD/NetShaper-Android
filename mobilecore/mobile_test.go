@@ -379,17 +379,17 @@ func TestMT17_DevTunnelBootCancelInterruptsHungSSH(t *testing.T) {
 				"name":  "mt17-hang",
 				"state": "Available",
 				"connection": map[string]any{
-					"tunnel_properties": map[string]any{
-						"connect_access_token":      hdr + "." + pay + ".sig",
-						"manage_ports_access_token": "mgt",
-						"service_uri":               srv.URL,
-						"tunnel_id":                 "t-mt17",
-						"cluster_id":                "c-mt17",
-						"domain":                    "devtunnels.ms",
+					"tunnelProperties": map[string]any{
+						"connectAccessToken":     hdr + "." + pay + ".sig",
+						"managePortsAccessToken": "mgt",
+						"serviceUri":             srv.URL,
+						"tunnelId":               "t-mt17",
+						"clusterId":              "c-mt17",
+						"domain":                 "devtunnels.ms",
 					},
 				},
 			})
-		case strings.HasPrefix(r.URL.Path, "/api/v1/tunnels/t-mt17"):
+		case strings.HasPrefix(r.URL.Path, "/tunnels/t-mt17"):
 			wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/relay"
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{

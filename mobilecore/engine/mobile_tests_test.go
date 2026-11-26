@@ -43,9 +43,14 @@ type mockDevTunnelStack struct {
 	connectToken       string
 	manageToken        string
 	sshdPort           uint16
-	tcpipForwardOK     atomic.Bool
-	portPutCalled      atomic.Bool
-	keepalivesReceived atomic.Int64
+	tcpipForwardOK      atomic.Bool
+	tcpipForwardReplyOk atomic.Bool
+	portPutCalled       atomic.Bool
+	portPutIfNoneMatch  atomic.Bool
+	portPutProtocolHTTP atomic.Bool
+	rpcAuthBearerSeen   atomic.Bool
+	useRawB64HostKey    atomic.Bool
+	keepalivesReceived  atomic.Int64
 	blackholeKeepalive atomic.Bool
 
 	mu               sync.Mutex
@@ -81,18 +86,25 @@ func startMockDevTunnelStack(t *testing.T, subprotocolMode string, preExposeSSHD
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/tunnels/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tunnels/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/ports/") {
 			if r.Header.Get("Authorization") != "tunnel "+st.manageToken {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
+			}
+			if r.Header.Get("If-None-Match") == "*" {
+				st.portPutIfNoneMatch.Store(true)
+			}
+			putRaw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+			if strings.Contains(string(putRaw), `"protocol":"http"`) {
+				st.portPutProtocolHTTP.Store(true)
 			}
 			st.portPutCalled.Store(true)
 			st.mu.Lock()
 			st.portExposed = true
 			st.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"portNumber":2222}`))
+			_, _ = w.Write([]byte(`{"portNumber":2222,"protocol":"http"}`))
 			return
 		}
 		if r.Header.Get("Authorization") != "tunnel "+st.connectToken {
@@ -100,6 +112,10 @@ func startMockDevTunnelStack(t *testing.T, subprotocolMode string, preExposeSSHD
 			return
 		}
 		wsURL := "ws" + strings.TrimPrefix(st.srv.URL, "http") + "/relay"
+		hostPub := st.outerHostPubLine
+		if st.useRawB64HostKey.Load() {
+			hostPub = base64.StdEncoding.EncodeToString(st.outerHostKey.PublicKey().Marshal())
+		}
 		doc := map[string]any{
 			"tunnelId":  "tun-mock-1",
 			"clusterId": "euw",
@@ -108,7 +124,7 @@ func startMockDevTunnelStack(t *testing.T, subprotocolMode string, preExposeSSHD
 					"id":             "ep-1",
 					"connectionMode": "TunnelRelay",
 					"clientRelayUri": wsURL,
-					"hostPublicKeys": []string{st.outerHostPubLine},
+					"hostPublicKeys": []string{hostPub},
 				},
 			},
 			"ports": []map[string]any{{"portNumber": 16634}},
@@ -200,12 +216,15 @@ func (st *mockDevTunnelStack) serveOuterSSH(conn net.Conn) {
 	st.wg.Add(1)
 	go func() {
 		defer st.wg.Done()
-		ok, _, err := sConn.SendRequest("tcpip-forward", true, ssh.Marshal(tcpipForwardPayload{
+		ok, replyBytes, err := sConn.SendRequest("tcpip-forward", true, ssh.Marshal(tcpipForwardPayload{
 			BindAddr: "127.0.0.1",
 			BindPort: codespaceRPCPort,
 		}))
 		if err == nil && ok {
 			st.tcpipForwardOK.Store(true)
+			if len(replyBytes) == 4 && binary.BigEndian.Uint32(replyBytes) == codespaceRPCPort {
+				st.tcpipForwardReplyOk.Store(true)
+			}
 		}
 	}()
 
@@ -276,6 +295,9 @@ func (st *mockDevTunnelStack) serveH2CGRPC(conn net.Conn) {
 			if r.URL.Path != startSSHServerGRPCPath {
 				w.WriteHeader(http.StatusNotFound)
 				return
+			}
+			if r.Header.Get("Authorization") == "Bearer token" {
+				st.rpcAuthBearerSeen.Store(true)
 			}
 			raw, _ := io.ReadAll(r.Body)
 			if len(raw) < 5 {
@@ -547,7 +569,7 @@ func TestMT01_InProcessDevTunnelMockEndToEndSOCKS5(t *testing.T) {
 				t.Fatal("MT-01 outer Dev Tunnels SSH did not reply true to host tcpip-forward")
 			}
 			if !stack.portPutCalled.Load() {
-				t.Fatal("MT-01 expected PUT /api/v1/tunnels/{id}/ports/2222 for unexposed sshd port")
+				t.Fatal("MT-01 expected PUT /tunnels/{id}/ports/2222 for unexposed sshd port")
 			}
 
 			// Verify remote DNS domain preservation through SOCKS5 ATYP=0x03 -> direct-tcpip!
@@ -1567,4 +1589,355 @@ func TestMT14_TokenRedactionLogRotationAndAppForegroundThrottle(t *testing.T) {
 	if len(ctrl.Logs().Since(0)) != 2 {
 		t.Fatalf("MT-14 expected ring buffer to still retain background lines for catch-up")
 	}
+}
+
+// =============================================================================
+// MT-19: Live GitHub camelCase `tunnelProperties`, Cold-Boot Budget <=5/6, & Singleflight Cache
+// =============================================================================
+func TestMT19_CamelCaseTunnelPropertiesColdBootBudgetAndCachedRetry(t *testing.T) {
+	var getCalls, startCalls atomic.Int32
+	expTime := time.Now().Add(45 * time.Minute).Truncate(time.Second)
+	jwt := makeMockJWT(expTime)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-GitHub-Api-Version") != "2022-11-28" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			startCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": "p5-camel-cs", "state": "Queued"})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/user/codespaces/p5-camel-cs"):
+			n := getCalls.Add(1)
+			state := "Shutdown"
+			switch {
+			case n == 2:
+				state = "Starting"
+			case n == 3:
+				state = "Starting"
+			case n >= 4:
+				state = "Available"
+			}
+			payload := map[string]any{
+				"name":  "p5-camel-cs",
+				"state": state,
+			}
+			if state == "Available" {
+				payload["connection"] = map[string]any{
+					"tunnelProperties": map[string]any{
+						"connectAccessToken":     jwt,
+						"managePortsAccessToken": "mgt_camel_secret",
+						"serviceUri":             "https://global.rel.tunnels.api.visualstudio.com/",
+						"tunnelId":               "camel-tun-99",
+						"clusterId":              "usw2",
+						"domain":                 "app.github.dev",
+						"hostPublicKeys":         []string{"AAAAC3NzaC1lZDI1NTE5AAAAIMockKey"},
+					},
+				}
+			}
+			_ = json.NewEncoder(w).Encode(payload)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "p5-camel-cs"
+	cfg.GitHubToken = "gho_camel_secret_token"
+	cfg.GitHubMinCallSpacing = 0
+	guard := NewGitHubGuard(cfg, nil, nil)
+	api := NewGitHubAPIClient(srv.URL, srv.URL, NewAntiPoisonResolver(nil, nil), guard)
+	if len(api.coldPollWait) < 3 {
+		t.Fatalf("MT-19 expected 3 adaptive coldPollWait intervals, got %d", len(api.coldPollWait))
+	}
+	api.SetColdPollDelays([]time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond})
+
+	creds := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := creds.Get(context.Background(), false)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if p.ConnectAccessToken != jwt || p.TunnelID != "camel-tun-99" || p.ClusterID != "usw2" || p.ServiceURI == "" {
+				errs <- fmt.Errorf("unexpected camelCase TunnelProperties: %+v", p)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("MT-19: %v", err)
+	}
+	totalCalls := int(getCalls.Load() + startCalls.Load())
+	if totalCalls > 5 || startCalls.Load() != 1 {
+		t.Fatalf("MT-19 cold boot exceeded 5-call WAF budget or missed single start: get=%d start=%d", getCalls.Load(), startCalls.Load())
+	}
+
+	// Second worker calling Get(false) must consume 0 GitHub API calls while cached JWT is fresh.
+	beforeGet := getCalls.Load()
+	if _, err := creds.Get(context.Background(), false); err != nil || getCalls.Load() != beforeGet {
+		t.Fatalf("MT-19 expected 0 extra API calls on cached JWT")
+	}
+
+	// Verify normalized cluster routing from global.rel -> <clusterId>.rel (dt_manager.go parity).
+	gotClusterURL := normalizeDevTunnelsAPIBase("https://global.rel.tunnels.api.visualstudio.com/", "usw2")
+	if gotClusterURL != "https://usw2.rel.tunnels.api.visualstudio.com" {
+		t.Fatalf("MT-19 normalizeDevTunnelsAPIBase mismatch: got=%q", gotClusterURL)
+	}
+	gotExplicitURL := normalizeDevTunnelsAPIBase("https://euw.rel.tunnels.api.visualstudio.com/api/v1/", "euw")
+	if gotExplicitURL != "https://euw.rel.tunnels.api.visualstudio.com" {
+		t.Fatalf("MT-19 expected /api/v1 stripped cleanly, got=%q", gotExplicitURL)
+	}
+}
+
+// =============================================================================
+// MT-20: DevTunnels Canonical Paths, Base64 Wire hostPublicKeys, 16634 Bearer Auth, Stage Logs & Redaction
+// =============================================================================
+func TestMT20_DevTunnelBase64HostKeysAndStageDiagnosticsAndRedaction(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	stack := startMockDevTunnelStack(t, devTunnelWSProtoV1, false)
+	stack.useRawB64HostKey.Store(true) // Real Microsoft Dev Tunnels format (no "ssh-ed25519 " prefix!)
+	defer stack.Close()
+
+	// Verify buildOuterHostKeyCallback rejects wrong keys and accepts raw base64 wire keys.
+	_, badPriv, _ := ed25519.GenerateKey(rand.Reader)
+	badSigner, _ := ssh.NewSignerFromKey(badPriv)
+	rawValidB64 := base64.StdEncoding.EncodeToString(stack.outerHostKey.PublicKey().Marshal())
+	cb, parsedN := buildOuterHostKeyCallback([]string{rawValidB64})
+	if parsedN != 1 {
+		t.Fatalf("MT-20 expected 1 parsed raw base64 host key, got %d", parsedN)
+	}
+	if err := cb("relay", nil, stack.outerHostKey.PublicKey()); err != nil {
+		t.Fatalf("MT-20 valid outer host key rejected: %v", err)
+	}
+	if err := cb("relay", nil, badSigner.PublicKey()); err == nil {
+		t.Fatal("MT-20 expected mismatched outer host key to be rejected")
+	}
+
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		p := stack.TunnelProperties()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":  "mt20-space",
+			"state": "Available",
+			"connection": map[string]any{
+				"tunnelProperties": map[string]any{
+					"connectAccessToken":     p.ConnectAccessToken,
+					"managePortsAccessToken": p.ManagePortsAccessToken,
+					"serviceUri":             p.ServiceURI,
+					"tunnelId":               p.TunnelID,
+					"clusterId":              p.ClusterID,
+					"domain":                 p.Domain,
+				},
+			},
+		})
+	}))
+	defer ghSrv.Close()
+
+	dir := t.TempDir()
+	logger, err := NewEventLogger(filepath.Join(dir, "events.jsonl"), 256*1024)
+	if err != nil {
+		t.Fatalf("MT-20 logger: %v", err)
+	}
+	rb := NewTerminalRingBuffer()
+	logger.SetObserver(func(rec LogRecord) {
+		sev, line := FormatLogRecord(rec)
+		rb.Append(sev, line)
+	})
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt20-space"
+	cfg.GitHubToken = "gho_mt20_super_secret_oauth_token"
+	cfg.GitHubAPIBaseURL = ghSrv.URL
+	cfg.LocalPort = 0
+	cfg.PoolSize = 1
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.GitHubMinCallSpacing = 0
+
+	resolver := NewAntiPoisonResolver(nil, nil)
+	guard := NewGitHubGuard(cfg, logger, nil)
+	api := NewGitHubAPIClient(ghSrv.URL, ghSrv.URL, resolver, guard)
+	creds := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	creds.SetLogger(logger)
+	hb := NewHeartbeatCoordinator(2 * time.Second)
+	defer hb.Close()
+	tr := NewDevTunnelSSHTransport(cfg, creds, resolver, hb, logger)
+
+	sess, err := tr.Connect(context.Background(), "tunnel-1")
+	if err != nil {
+		_ = logger.Close()
+		t.Fatalf("MT-20 Connect failed: %v", err)
+	}
+	defer sess.Close()
+
+	if !stack.tcpipForwardReplyOk.Load() {
+		t.Fatal("MT-20 expected 4-byte PortForwardSuccess uint32 reply to tcpip-forward")
+	}
+	if !stack.rpcAuthBearerSeen.Load() {
+		t.Fatal("MT-20 expected Authorization: Bearer token on port 16634 h2c gRPC call")
+	}
+	if !stack.portPutCalled.Load() || !stack.portPutIfNoneMatch.Load() || !stack.portPutProtocolHTTP.Load() {
+		t.Fatalf("MT-20 expected PUT /tunnels/.../ports/2222 with If-None-Match:* & protocol=http (called=%v inm=%v proto=%v)",
+			stack.portPutCalled.Load(), stack.portPutIfNoneMatch.Load(), stack.portPutProtocolHTTP.Load())
+	}
+
+	_ = sess.Close()
+	hb.Close()
+	_ = logger.Close()
+
+	lines := rb.Since(0)
+	var sawStages [8]bool
+	secrets := []string{cfg.GitHubToken, stack.connectToken, stack.manageToken}
+	for _, ln := range lines {
+		for _, sec := range secrets {
+			if sec != "" && strings.Contains(ln.Text, sec) {
+				t.Fatalf("MT-20 secret leaked in terminal log: %s", ln.Text)
+			}
+		}
+		for s := 1; s <= 7; s++ {
+			if strings.Contains(ln.Text, fmt.Sprintf("[Boot %d/7]", s)) {
+				sawStages[s] = true
+			}
+		}
+	}
+	for s := 1; s <= 7; s++ {
+		if !sawStages[s] {
+			t.Fatalf("MT-20 missing stage log [Boot %d/7] in ring buffer", s)
+		}
+	}
+	// Verify RedactSecrets handles camelCase JSON secret fields & URL query token params.
+	rawSample := `{"connectAccessToken":"tokSecret99"}&access_token=abc12345678&token=xyzSecret000 tunnel ` + stack.connectToken
+	redacted := RedactSecrets(rawSample)
+	if strings.Contains(redacted, "tokSecret99") || strings.Contains(redacted, "abc12345678") ||
+		strings.Contains(redacted, "xyzSecret000") || strings.Contains(redacted, stack.connectToken) {
+		t.Fatalf("MT-20 RedactSecrets failed to scrub camelCase/query/tunnel secrets: %s", redacted)
+	}
+
+	stack.Close()
+	ghSrv.Close()
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+// =============================================================================
+// MT-21: Available Empty `tunnelProperties` Fail-Fast + Sole Cellular Gate + Failure Logs
+// =============================================================================
+func TestMT21_EmptyTunnelPropertiesFailFastAndNoSilentConnectErrors(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	var getCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/user/codespaces/empty-props-cs") {
+			getCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":       "empty-props-cs",
+				"state":      "Available",
+				"connection": map[string]any{"tunnelProperties": map[string]any{}},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	logger, _ := NewEventLogger(filepath.Join(t.TempDir(), "mt21.jsonl"), 128*1024)
+	rb := NewTerminalRingBuffer()
+	logger.SetObserver(func(rec LogRecord) {
+		sev, line := FormatLogRecord(rec)
+		rb.Append(sev, line)
+	})
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "empty-props-cs"
+	cfg.GitHubToken = "ghp_limited_pat_secret_123456"
+	cfg.GitHubMinCallSpacing = 0
+	guard := NewGitHubGuard(cfg, logger, nil)
+	api := NewGitHubAPIClient(srv.URL, srv.URL, NewAntiPoisonResolver(nil, nil), guard)
+	api.SetColdPollDelays([]time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 10 * time.Millisecond})
+	creds := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	creds.SetLogger(logger)
+
+	_, err := creds.Get(context.Background(), false)
+	var fatalErr *FatalBootError
+	if !errors.As(err, &fatalErr) || fatalErr.Code != "missing_tunnel_props" {
+		t.Fatalf("MT-21 expected FatalBootError(missing_tunnel_props), got err=%v", err)
+	}
+	if getCalls.Load() != 2 {
+		t.Fatalf("MT-21 expected strictly 2 API calls (initial + 1 verify) on empty Available props, got %d", getCalls.Load())
+	}
+
+	// Verify sole cellular worker (underlay=101ms, RTT=380ms -> rho=3.76 > 3.5, peerMedian=0)
+	// accepts on attempt 1 WITHOUT discarding valid tunnels twice, AND non-fatal Connect errors log WORKER_BOOT_FAIL.
+	var connectAttempts atomic.Int32
+	tr := &mockTransport{
+		onConn: func(workerID string, seq int64) (*mockWorkerSession, error) {
+			if connectAttempts.Add(1) == 1 {
+				return nil, errors.New("[3/7 wss dial http=502] simulated bad gateway tunnel " + "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE5MDAwMDAwMDB9.LeakTestSig")
+			}
+			return newMockWorkerSession("20.120.56.11:443"), nil
+		},
+	}
+	bootCfg := DefaultConfig()
+	bootCfg.BootQualitySamples = 2
+	bootCfg.BootQualityMaxRetries = 2
+	bootCfg.BootQualityMaxRTT = 1000 * time.Millisecond
+	bootCfg.BootMicroPayloadCheck = true
+	ti := NewTunnelInstance(
+		"tunnel-1",
+		bootCfg,
+		tr,
+		func(context.Context, WorkerSession, string, time.Duration) (time.Duration, error) {
+			return 380 * time.Millisecond, nil // rho = 380 / 101 = 3.76 > 3.5!
+		},
+		func(context.Context, WorkerSession, string, time.Duration) (time.Duration, error) {
+			return 385 * time.Millisecond, nil
+		},
+		logger,
+		nil,
+		guard,
+	)
+	ti.sampleDel = time.Millisecond
+	ti.retryDel = time.Millisecond
+	if _, _, err := ti.BootAndQualify(context.Background(), func(string) float64 { return 0 }, func() float64 { return 101.0 }); err == nil {
+		t.Fatal("MT-21 expected attempt 1 Connect error to surface and log")
+	}
+	sess, rep, err := ti.BootAndQualify(context.Background(), func(string) float64 { return 0 }, func() float64 { return 101.0 })
+	if err != nil {
+		t.Fatalf("MT-21 sole cellular worker failed instead of accepting on attempt 1: %v", err)
+	}
+	_ = sess.Close()
+	if connectAttempts.Load() != 2 {
+		t.Fatalf("MT-21 expected 1 failed + 1 sole cellular accept (2 Connect calls), got %d (P50=%dms rho=%.2f)", connectAttempts.Load(), rep.P50MS, rep.RelativeRho)
+	}
+
+	_ = logger.Close()
+	var sawPropsMissing, sawBootFail, sawBootOK bool
+	for _, ln := range rb.Since(0) {
+		if strings.Contains(ln.Text, "LeakTestSig") || strings.Contains(ln.Text, cfg.GitHubToken) {
+			t.Fatalf("MT-21 secret leaked in log: %s", ln.Text)
+		}
+		if strings.Contains(ln.Text, "missing tunnelProperties") {
+			sawPropsMissing = true
+		}
+		if strings.Contains(ln.Text, "[Boot] tunnel-1 failed:") {
+			sawBootFail = true
+		}
+		if strings.Contains(ln.Text, "[Boot] tunnel-1 online") {
+			sawBootOK = true
+		}
+	}
+	if !sawPropsMissing || !sawBootFail || !sawBootOK {
+		t.Fatalf("MT-21 missing expected diagnostics: props=%v fail=%v ok=%v", sawPropsMissing, sawBootFail, sawBootOK)
+	}
+	srv.Close()
+	assertGoroutinesClean(t, baseG, 8)
 }

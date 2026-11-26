@@ -51,15 +51,17 @@ var (
 	reGitHubPAT    = regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{12,}\b`)
 	reBearerAuth   = regexp.MustCompile(`(?i)\b(Bearer|token|tunnel)\s+[A-Za-z0-9._~+/=-]{8,}`)
 	reJWTToken     = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	reJSONSecField = regexp.MustCompile(`(?i)("(?:access_token|github_token|connect_access_token|manage_ports_access_token|authorization)"\s*:\s*")([^"]+)(")`)
+	reJSONSecField = regexp.MustCompile(`(?i)("(?:access_token|github_token|connect_access_token|manage_ports_access_token|connectAccessToken|managePortsAccessToken|authorization)"\s*:\s*")([^"]+)(")`)
+	reURLSecParam  = regexp.MustCompile(`(?i)([?&](?:access_token|token|connect_access_token|manage_ports_access_token|connectAccessToken|managePortsAccessToken)=)([^&\s"']+)`)
 )
 
-// RedactSecrets strips GitHub OAuth tokens, PATs, Bearer/tunnel headers, and Dev Tunnels JWTs.
+// RedactSecrets strips GitHub OAuth tokens, PATs, Bearer/tunnel headers, URL query secrets, and Dev Tunnels JWTs.
 func RedactSecrets(s string) string {
 	if s == "" {
 		return ""
 	}
 	s = reJSONSecField.ReplaceAllString(s, `${1}[REDACTED]${3}`)
+	s = reURLSecParam.ReplaceAllString(s, `${1}[REDACTED]`)
 	s = reGitHubPAT.ReplaceAllString(s, "[REDACTED_GH_PAT]")
 	s = reGitHubToken.ReplaceAllString(s, "[REDACTED_GH_TOKEN]")
 	s = reJWTToken.ReplaceAllString(s, "[REDACTED_JWT]")
@@ -472,15 +474,25 @@ func FormatLogRecord(rec LogRecord) (LogSeverity, string) {
 	case "GITHUB_API_THROTTLED":
 		return LogWarn, fmt.Sprintf("[WAF Guard] throttled (%s) wait=%sms 5m=%s", sf("block_reason"), sf("wait_ms"), sf("calls_last_5m"))
 	case "FATAL_BOOT_ERROR":
-		return LogError, fmt.Sprintf("[Fatal] %s", sf("message"))
+		return LogError, fmt.Sprintf("[Fatal] %s", RedactSecrets(sf("message")))
+	case "GITHUB_TUNNEL_PROPS_MISSING":
+		return LogError, fmt.Sprintf("[GitHub] codespace=%s missing tunnelProperties (%s) — use Option A Device Flow", sf("codespace"), sf("keys"))
+	case "WORKER_BOOT_STAGE":
+		return LogInfo, fmt.Sprintf("[Boot %s] %s: %s", sf("stage"), sf("tunnel_id"), RedactSecrets(sf("detail")))
+	case "WORKER_BOOT_FAIL":
+		return LogError, fmt.Sprintf("[Boot] %s failed: %s", sf("tunnel_id"), RedactSecrets(sf("error")))
+	case "WORKER_PROBE_FAIL":
+		return LogWarn, fmt.Sprintf("[Probe] %s target=%s failed: %s", sf("tunnel_id"), sf("target"), RedactSecrets(sf("error")))
+	case "WORKER_BOOT_OK":
+		return LogSuccess, fmt.Sprintf("[Boot] %s online rtt=%sms wan=%s pmtu576=%s", sf("tunnel_id"), sf("p50_ms"), sf("wan_remote"), sf("pmtu576"))
 	case "PANIC_RECOVERED":
 		return LogError, fmt.Sprintf("[Panic] recovered in %s: %s", sf("goroutine"), sf("panic"))
 	default:
 		if e := sf("error"); e != "" {
-			return LogWarn, fmt.Sprintf("[%s] %s", rec.Event, e)
+			return LogWarn, fmt.Sprintf("[%s] %s", rec.Event, RedactSecrets(e))
 		}
 		if r := sf("reason"); r != "" {
-			return LogInfo, fmt.Sprintf("[%s] %s", rec.Event, r)
+			return LogInfo, fmt.Sprintf("[%s] %s", rec.Event, RedactSecrets(r))
 		}
 		return LogInfo, fmt.Sprintf("[%s]", rec.Event)
 	}
