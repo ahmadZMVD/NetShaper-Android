@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetShaper</string>
+    <string name="notification_channel_name">NetShaper Tunnel Engine</string>
+    <string name="notification_channel_desc">Persistent status for the local SOCKS5 multi-tunnel proxy</string>
+</resources>
