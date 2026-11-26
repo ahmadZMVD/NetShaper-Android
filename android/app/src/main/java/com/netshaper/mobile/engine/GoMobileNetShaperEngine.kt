@@ -148,7 +148,7 @@ class GoMobileNetShaperEngine : NetShaperEngine {
         Unit
     }
 
-    override fun getV2RayNGProfileURI(): String = invokeGo { b ->
+    override fun getV2RayNGProfileUri(): String = invokeGo { b ->
         b.mGetV2RayNGProfileURI.invoke(null) as? String ?: "socks://127.0.0.1:1080#NetShaper"
     }.getOrElse { "socks://127.0.0.1:1080#NetShaper" }
 
