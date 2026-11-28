@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -637,11 +638,18 @@ func (p *TunnelPool) evaluateIdlePowerState(now time.Time) {
 		return
 	}
 	var activeTotal int64
+	var latestWAN time.Time
 	for _, w := range p.workers {
 		activeTotal += w.activeStreams.Load()
+		if lw := w.LastWANBytesAt(); !lw.IsZero() && !lw.After(now) && lw.After(latestWAN) {
+			latestWAN = lw
+		}
 	}
 
 	p.powerMu.Lock()
+	if latestWAN.After(p.lastTrafficAt) {
+		p.lastTrafficAt = latestWAN
+	}
 	if activeTotal > 0 {
 		prev := p.powerState
 		p.lastTrafficAt = now
@@ -685,7 +693,8 @@ func (p *TunnelPool) evaluateIdlePowerState(now time.Time) {
 	}
 }
 
-// EvaluateRoutingMode executes exact v6.4 3-layer Schmitt-trigger hysteresis (ignoring TunnelParked workers).
+// EvaluateRoutingMode executes exact v6.4 3-layer Schmitt-trigger hysteresis (ignoring TunnelParked workers)
+// enhanced with Stage-2 multi-metric composite scoring, lossy-primary override, and sticky profile support.
 func (p *TunnelPool) EvaluateRoutingMode(now time.Time) {
 	p.mu.RLock()
 	workers := p.workers
@@ -707,6 +716,21 @@ func (p *TunnelPool) EvaluateRoutingMode(now time.Time) {
 	fastRatio := p.cfg.FastLaneMaxRatio
 	if fastRatio < 1.0 {
 		fastRatio = DefaultFastLaneMaxRatio
+	}
+	maxActiveErrRate := p.cfg.ActiveStreamMaxErrRate
+	if maxActiveErrRate <= 0 {
+		maxActiveErrRate = DefaultActiveStreamMaxErrRate
+	}
+	if strings.EqualFold(strings.TrimSpace(p.cfg.RoutingProfile), "sticky") {
+		if dwell < 60*time.Second {
+			dwell = 60 * time.Second
+		}
+		if relMargin < 0.40 {
+			relMargin = 0.40
+		}
+		if absMarginMS < 80.0 {
+			absMarginMS = 80.0
+		}
 	}
 
 	var healthyFast []*TunnelInstance
@@ -761,6 +785,19 @@ func (p *TunnelPool) EvaluateRoutingMode(now time.Time) {
 				relGain = (incScore - bestScore) / incScore
 			}
 			absGainMS := compareAgainst.EWMARTTMS() - best.EWMARTTMS()
+			lossyYield := compareAgainst.StreamErrorRate() >= maxActiveErrRate &&
+				best.StreamErrorRate() < maxActiveErrRate &&
+				bestScore < incScore
+			if lossyYield {
+				prevPrimary := p.primaryTunnelID
+				p.primaryTunnelID = best.ID()
+				p.challengerID = ""
+				p.challengerSince = time.Time{}
+				p.rebalanceSince = time.Time{}
+				p.primarySwitches.Add(1)
+				p.logPrimarySwitchLocked(prevPrimary, best.ID(), "lossy_primary_demoted", baselineMS, relGain, absGainMS)
+				return
+			}
 			if relGain >= relMargin && absGainMS >= absMarginMS {
 				p.rebalanceSince = time.Time{}
 				if p.challengerID != best.ID() {
@@ -781,7 +818,7 @@ func (p *TunnelPool) EvaluateRoutingMode(now time.Time) {
 		}
 		allFast := true
 		for _, w := range healthyFast {
-			if w.Rho(baselineMS) > fastRatio {
+			if w.Rho(baselineMS) > fastRatio || w.StreamErrorRate() >= maxActiveErrRate {
 				allFast = false
 				break
 			}
@@ -818,6 +855,20 @@ func (p *TunnelPool) EvaluateRoutingMode(now time.Time) {
 		relGain = (worstScore - bestScore) / worstScore
 	}
 	absGainMS := worst.EWMARTTMS() - best.EWMARTTMS()
+	lossyDemote := worst.StreamErrorRate() >= maxActiveErrRate &&
+		best.StreamErrorRate() < maxActiveErrRate &&
+		bestScore < worstScore
+	if lossyDemote {
+		prevPrimary := p.primaryTunnelID
+		p.routingMode = "primary_preferred"
+		p.primaryTunnelID = best.ID()
+		p.challengerID = ""
+		p.challengerSince = time.Time{}
+		p.rebalanceSince = time.Time{}
+		p.primarySwitches.Add(1)
+		p.logPrimarySwitchLocked(prevPrimary, best.ID(), "lossy_peer_avoided", baselineMS, relGain, absGainMS)
+		return
+	}
 	if relGain >= relMargin && absGainMS >= absMarginMS {
 		if p.challengerID != best.ID() {
 			p.challengerID = best.ID()
@@ -856,7 +907,9 @@ func (p *TunnelPool) logPrimarySwitchLocked(fromID, toID, reason string, baselin
 	}
 }
 
-// CheckSlowLaneEviction evicts chronic slow-lane workers (TunnelHealthy OR TunnelDegraded) gated by GitHubGuard.
+// CheckSlowLaneEviction applies Stage-2 anti-starvation, soft demotion, Active-Stream Shield,
+// Blackhole Rescue Override, absolute RTT floor, peer advantage, and sticky-profile guards
+// before triggering destructive slow-lane eviction (gated by GitHubGuard).
 func (p *TunnelPool) CheckSlowLaneEviction(now time.Time) int {
 	p.mu.RLock()
 	workers := p.workers
@@ -878,8 +931,37 @@ func (p *TunnelPool) CheckSlowLaneEviction(now time.Time) int {
 	if evictWindow <= 0 {
 		evictWindow = DefaultSlowLaneEvictWindow
 	}
+	absFloorMS := float64(p.cfg.SlowLaneAbsoluteFloor.Milliseconds())
+	if absFloorMS <= 0 {
+		absFloorMS = float64(DefaultSlowLaneAbsoluteFloor.Milliseconds())
+	}
+	peerAdvMS := p.cfg.SlowLanePeerAdvantageMS
+	if peerAdvMS <= 0 {
+		peerAdvMS = DefaultSlowLanePeerAdvantageMS
+	}
+	peerAdvRatio := p.cfg.SlowLanePeerAdvantageRatio
+	if peerAdvRatio < 1.0 {
+		peerAdvRatio = DefaultSlowLanePeerAdvantageRatio
+	}
+	livenessWindow := p.cfg.ActiveStreamLivenessWindow
+	if livenessWindow <= 0 {
+		livenessWindow = DefaultActiveStreamLivenessWindow
+	}
+	stallWindow := p.cfg.ActiveStreamStallWindow
+	if stallWindow <= 0 {
+		stallWindow = DefaultActiveStreamStallWindow
+	}
+	maxActiveErrRate := p.cfg.ActiveStreamMaxErrRate
+	if maxActiveErrRate <= 0 {
+		maxActiveErrRate = DefaultActiveStreamMaxErrRate
+	}
+	blackholeErrRate := p.cfg.BlackholeErrRate
+	if blackholeErrRate <= 0 {
+		blackholeErrRate = DefaultBlackholeErrRate
+	}
+	sticky := strings.EqualFold(strings.TrimSpace(p.cfg.RoutingProfile), "sticky")
 
-	if baselineMS > underlayCeilingMS {
+	clearAllSlowState := func() {
 		for _, w := range workers {
 			w.stateMu.Lock()
 			w.slowLaneSince = time.Time{}
@@ -889,14 +971,27 @@ func (p *TunnelPool) CheckSlowLaneEviction(now time.Time) int {
 			}
 			w.ResetEvictionState()
 		}
+	}
+
+	if baselineMS > underlayCeilingMS {
+		clearAllSlowState()
 		return 0
 	}
 
 	healthyFastCount := 0
+	bestFastPeerRTTMS := 0.0
 	for _, w := range workers {
-		if w.State() == TunnelHealthy && !w.IsSlowLaneDegraded() && w.Rho(baselineMS) <= evictRatio {
+		if w.State() == TunnelHealthy && !w.IsSlowLaneDegraded() && w.Rho(baselineMS) <= evictRatio && w.StreamErrorRate() < maxActiveErrRate {
 			healthyFastCount++
+			if rtt := w.EWMARTTMS(); rtt > 0 && (bestFastPeerRTTMS == 0 || rtt < bestFastPeerRTTMS) {
+				bestFastPeerRTTMS = rtt
+			}
 		}
+	}
+	if healthyFastCount == 0 {
+		// Anti-starvation guard: ISP-wide congestion pushed all workers above ratio or no clean fast peer exists.
+		clearAllSlowState()
+		return 0
 	}
 
 	evicted := 0
@@ -917,8 +1012,54 @@ func (p *TunnelPool) CheckSlowLaneEviction(now time.Time) int {
 			elapsed := now.Sub(w.slowLaneSince)
 			w.stateMu.Unlock()
 
-			if elapsed >= evictWindow && healthyFastCount >= 1 {
+			if elapsed >= evictWindow {
+				// Always apply Soft Demotion first so AcquireEndpoint diverts NEW connections to the fast peer.
 				w.SetSlowLaneDegraded(true)
+
+				blackholed := w.IsStreamBlackholed(now, stallWindow, blackholeErrRate)
+				lastWAN := w.LastWANBytesAt()
+				thinkingPause := w.ActiveConns() > 0 && !lastWAN.IsZero() && w.StreamErrorRate() < maxActiveErrRate && now.Sub(lastWAN) < stallWindow
+				shieldActive := p.cfg.ActiveStreamShieldEnabled && !blackholed &&
+					(w.IsActivelyFlowing(now, livenessWindow, maxActiveErrRate) || thinkingPause)
+
+				if sticky && !blackholed {
+					continue
+				}
+				if shieldActive {
+					if w.MarkSoftDrainLogged() && p.logger != nil {
+						var lastAgeMS int64 = -1
+						if !lastWAN.IsZero() {
+							if d := now.Sub(lastWAN).Milliseconds(); d >= 0 {
+								lastAgeMS = d
+							} else {
+								lastAgeMS = 0
+							}
+						}
+						p.logger.Log("WORKER_SLOW_LANE_SOFT_DRAIN", map[string]any{
+							"tunnel_id":            w.ID(),
+							"active_conns":         w.ActiveConns(),
+							"ewma_rtt_ms":          round2(w.EWMARTTMS()),
+							"underlay_baseline_ms": round2(baselineMS),
+							"relative_rho":         round2(rho),
+							"stream_err_rate":      round2(w.StreamErrorRate()),
+							"last_wan_bytes_age_ms": lastAgeMS,
+						})
+					}
+					continue
+				}
+
+				ewmaMS := w.EWMARTTMS()
+				if !blackholed {
+					if absFloorMS > 0 && ewmaMS < absFloorMS {
+						continue
+					}
+					if bestFastPeerRTTMS > 0 {
+						if (ewmaMS-bestFastPeerRTTMS) < peerAdvMS || (ewmaMS/bestFastPeerRTTMS) < peerAdvRatio {
+							continue
+						}
+					}
+				}
+
 				if evicted == 0 && !w.IsEvictionTriggered() {
 					if p.guard != nil {
 						if canReroll, deferReason := p.guard.CanAllowNonConsuming(); !canReroll {
@@ -926,7 +1067,7 @@ func (p *TunnelPool) CheckSlowLaneEviction(now time.Time) int {
 								p.logger.Log("WORKER_SLOW_LANE_EVICT_DEFERRED", map[string]any{
 									"tunnel_id":            w.ID(),
 									"defer_reason":         deferReason,
-									"ewma_rtt_ms":          round2(w.EWMARTTMS()),
+									"ewma_rtt_ms":          round2(ewmaMS),
 									"underlay_baseline_ms": round2(baselineMS),
 									"relative_rho":         round2(rho),
 								})
@@ -941,9 +1082,10 @@ func (p *TunnelPool) CheckSlowLaneEviction(now time.Time) int {
 							p.logger.Log("WORKER_SLOW_LANE_EVICT", map[string]any{
 								"tunnel_id":            w.ID(),
 								"worker_state":         string(st),
-								"ewma_rtt_ms":          round2(w.EWMARTTMS()),
+								"ewma_rtt_ms":          round2(ewmaMS),
 								"underlay_baseline_ms": round2(baselineMS),
 								"relative_rho":         round2(rho),
+								"blackholed":           blackholed,
 							})
 						}
 						w.TriggerEviction("chronic_slow_lane")
@@ -1078,11 +1220,11 @@ func (p *TunnelPool) AcquireEndpoint(ctx context.Context) (UpstreamLease, error)
 	}
 
 	// Pass 2 (Burst Cap): surviving healthy worker(s) absorb up to MaxActiveConns=64 when peer is parked/booting/evicted.
+	globalCap := p.cfg.MaxActiveConns
+	if globalCap < perTunnelCap {
+		globalCap = perTunnelCap
+	}
 	if len(healthyFast) < len(workers) {
-		globalCap := p.cfg.MaxActiveConns
-		if globalCap < perTunnelCap {
-			globalCap = perTunnelCap
-		}
 		burstCap := perTunnelCap
 		if len(healthyFast) == 1 {
 			burstCap = globalCap
@@ -1109,6 +1251,23 @@ func (p *TunnelPool) AcquireEndpoint(ctx context.Context) (UpstreamLease, error)
 				return order[i].RoutingScore() < order[j].RoutingScore()
 			})
 			if lease, ok := tryAcquireFromOrder(order, burstCap); ok {
+				return lease, nil
+			}
+		}
+	}
+
+	// Pass 3 (Anti-Starvation Fallback): if healthyFast is completely saturated, spill to soft-demoted or degraded peers.
+	if len(healthyFast) > 0 {
+		for _, fb := range [][]*TunnelInstance{healthySlow, degraded} {
+			if len(fb) == 0 {
+				continue
+			}
+			fbOrder := make([]*TunnelInstance, len(fb))
+			copy(fbOrder, fb)
+			sort.SliceStable(fbOrder, func(i, j int) bool {
+				return fbOrder[i].RoutingScore() < fbOrder[j].RoutingScore()
+			})
+			if lease, ok := tryAcquireFromOrder(fbOrder, globalCap); ok {
 				return lease, nil
 			}
 		}
@@ -1427,7 +1586,11 @@ func (p *TunnelPool) superviseWorker(ctx context.Context, idx int, w *TunnelInst
 		}
 		drainTimeout := 300 * time.Millisecond
 		if reason == "chronic_slow_lane" {
-			drainTimeout = 1500 * time.Millisecond
+			if w.ActiveConns() > 0 {
+				drainTimeout = 3000 * time.Millisecond
+			} else {
+				drainTimeout = 50 * time.Millisecond
+			}
 		}
 		w.DrainAndClose(drainTimeout, TunnelDead)
 

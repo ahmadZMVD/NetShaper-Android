@@ -982,6 +982,10 @@ func (p *ProxyServer) relayBidirectional(localConn, remoteConn net.Conn, tunnelI
 			connUpBytes.Add(uint64(n))
 			p.bytesUpWindow.Add(uint64(n))
 			p.totalBytesUp.Add(uint64(n))
+			p.lastBytesMovedNS.Store(now.UnixNano())
+			if p.selector != nil {
+				p.selector.NotifyWANBytes(tunnelID, uint64(n))
+			}
 			if !downClean.Load() {
 				remoteDC.refreshReadDeadline(now)
 			}

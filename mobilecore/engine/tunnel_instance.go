@@ -65,6 +65,8 @@ type TunnelInstance struct {
 	dialFailures      atomic.Uint64
 	restarts          atomic.Int64
 	lastWANBytes      atomic.Int64
+	totalWANBytes     atomic.Uint64
+	healthySinceNano  atomic.Int64
 	ewmaRTTBits       atomic.Uint64
 	ewmaJitterBits    atomic.Uint64
 	lastRTTBits       atomic.Uint64
@@ -72,6 +74,7 @@ type TunnelInstance struct {
 	slowLaneDegraded  atomic.Bool
 	evictionTriggered atomic.Bool
 	evictDeferLogged  atomic.Bool
+	softDrainLogged   atomic.Bool
 	vmReached         atomic.Bool
 
 	stateMu       sync.RWMutex
@@ -161,7 +164,10 @@ func (t *TunnelInstance) setState(next TunnelState) {
 		t.slowLaneSince = time.Time{}
 	}
 	t.stateMu.Unlock()
-	if next == TunnelStarting || next == TunnelDead || next == TunnelParked {
+	if next == TunnelHealthy && prev != TunnelHealthy {
+		t.healthySinceNano.Store(time.Now().UnixNano())
+	} else if next == TunnelStarting || next == TunnelDead || next == TunnelParked {
+		t.healthySinceNano.Store(0)
 		t.slowLaneDegraded.Store(false)
 		t.ResetEvictionState()
 	}
@@ -205,6 +211,9 @@ func (t *TunnelInstance) IsSlowLaneDegraded() bool { return t.slowLaneDegraded.L
 
 func (t *TunnelInstance) SetSlowLaneDegraded(degraded bool) {
 	prev := t.slowLaneDegraded.Swap(degraded)
+	if !degraded {
+		t.softDrainLogged.Store(false)
+	}
 	if prev != degraded && t.metrics != nil {
 		t.metrics.Emit("tunnel", map[string]any{
 			"tunnel_id":          t.id,
@@ -221,9 +230,16 @@ func (t *TunnelInstance) MarkEvictionTriggered() bool {
 func (t *TunnelInstance) MarkEvictDeferLogged() bool {
 	return t.evictDeferLogged.CompareAndSwap(false, true)
 }
+func (t *TunnelInstance) MarkSoftDrainLogged() bool {
+	return t.softDrainLogged.CompareAndSwap(false, true)
+}
+func (t *TunnelInstance) ResetSoftDrainLogged() {
+	t.softDrainLogged.Store(false)
+}
 func (t *TunnelInstance) ResetEvictionState() {
 	t.evictionTriggered.Store(false)
 	t.evictDeferLogged.Store(false)
+	t.softDrainLogged.Store(false)
 }
 
 func (t *TunnelInstance) setActiveBootCancel(cancel context.CancelFunc) {
@@ -366,8 +382,17 @@ func (t *TunnelInstance) RecordStreamError() {
 	}
 }
 
+func (t *TunnelInstance) ActiveConns() int64 {
+	return t.activeStreams.Load()
+}
+
+func (t *TunnelInstance) TotalWANBytes() uint64 {
+	return t.totalWANBytes.Load()
+}
+
 func (t *TunnelInstance) RecordWANBytes(n uint64) {
 	if n > 0 {
+		t.totalWANBytes.Add(n)
 		t.lastWANBytes.Store(time.Now().UnixNano())
 	}
 }
@@ -378,6 +403,59 @@ func (t *TunnelInstance) LastWANBytesAt() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, ns)
+}
+
+// IsActivelyFlowing returns true (100% lock-free) when this tunnel carries live streams with
+// acceptable error rate and recent bidirectional WAN byte flow (or fresh healthy grace window).
+func (t *TunnelInstance) IsActivelyFlowing(now time.Time, livenessWindow time.Duration, maxErrRate float64) bool {
+	if t.ActiveConns() <= 0 {
+		return false
+	}
+	if maxErrRate <= 0 {
+		maxErrRate = DefaultActiveStreamMaxErrRate
+	}
+	if t.StreamErrorRate() >= maxErrRate {
+		return false
+	}
+	if livenessWindow <= 0 {
+		livenessWindow = DefaultActiveStreamLivenessWindow
+	}
+	last := t.LastWANBytesAt()
+	if !last.IsZero() {
+		d := now.Sub(last)
+		if d >= -time.Minute && d <= livenessWindow {
+			return true
+		}
+	}
+	if hs := t.healthySinceNano.Load(); hs > 0 {
+		d := now.Sub(time.Unix(0, hs))
+		if d >= -time.Minute && d <= livenessWindow {
+			return true
+		}
+	}
+	return false
+}
+
+// IsStreamBlackholed returns true (100% lock-free) when active streams experience >= 3 consecutive
+// errors (rate >= 0.35) or a sustained silent data-plane stall (>= stallWindow with 0 WAN bytes).
+func (t *TunnelInstance) IsStreamBlackholed(now time.Time, stallWindow time.Duration, blackholeErrRate float64) bool {
+	if t.ActiveConns() <= 0 {
+		return false
+	}
+	if blackholeErrRate <= 0 {
+		blackholeErrRate = DefaultBlackholeErrRate
+	}
+	if t.StreamErrorRate() >= blackholeErrRate {
+		return true
+	}
+	if stallWindow <= 0 {
+		stallWindow = DefaultActiveStreamStallWindow
+	}
+	last := t.LastWANBytesAt()
+	if !last.IsZero() && now.Sub(last) >= stallWindow {
+		return true
+	}
+	return false
 }
 
 func (t *TunnelInstance) TryAcquireSlotWithCap(capLimit int) bool {
@@ -408,17 +486,27 @@ func (t *TunnelInstance) ReleaseSlot() {
 	}
 }
 
+// QualityScore computes the Stage-2 multi-metric composite health score (lower is healthier).
 func (t *TunnelInstance) QualityScore(baselineMS float64) float64 {
 	denom := baselineMS
 	if denom < 50.0 {
 		denom = 50.0
 	}
-	rho := t.Rho(denom)
-	jitterRatio := t.EWMAJitterMS() / denom
+	rtt := t.EWMARTTMS()
+	if rtt <= 0 {
+		rtt = denom
+	}
+	rho := rtt / denom
+	jitterNorm := t.EWMAJitterMS() / denom
 	errRate := t.StreamErrorRate()
-	score := rho + 0.5*jitterRatio + 2.0*errRate
+	perCap := t.cfg.PerTunnelMaxConns
+	if perCap <= 0 {
+		perCap = DefaultPerTunnelMaxConns
+	}
+	loadRatio := float64(t.ActiveConns()) / float64(perCap)
+	score := rho + 0.35*jitterNorm + 8.0*errRate + 0.15*loadRatio
 	if t.IsSlowLaneDegraded() || t.State() == TunnelDegraded {
-		score *= 4.0
+		score += 4.0
 	}
 	return score
 }
@@ -432,7 +520,7 @@ func (t *TunnelInstance) RoutingScore() float64 {
 	if rtt < 1.0 {
 		rtt = 1.0
 	}
-	penalty := 1.0 + 2.0*t.StreamErrorRate()
+	penalty := 1.0 + 8.0*t.StreamErrorRate() + 0.35*(t.EWMAJitterMS()/200.0)
 	if t.State() == TunnelDegraded || t.IsSlowLaneDegraded() {
 		penalty *= 4.0
 	}
@@ -588,8 +676,24 @@ func (t *TunnelInstance) BootAndQualify(
 		microOK := true
 		var microRTT time.Duration
 		if t.cfg.BootMicroPayloadCheck && failures == 0 && t.cfg.BootQualitySamples > 1 {
+			microTimeout := t.cfg.ProbeTimeout
+			if microTimeout <= 0 {
+				microTimeout = DefaultProbeTimeout
+			}
+			var maxObsRTT time.Duration
+			for _, r := range rtts {
+				if r > maxObsRTT {
+					maxObsRTT = r
+				}
+			}
+			if needed := 2*maxObsRTT + 4*time.Second; needed > microTimeout {
+				if needed > 25*time.Second {
+					needed = 25 * time.Second
+				}
+				microTimeout = needed
+			}
 			var mpErr error
-			microRTT, mpErr = t.microFn(attemptCtx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
+			microRTT, mpErr = t.microFn(attemptCtx, sess, t.cfg.ProbeTarget, microTimeout)
 			if mpErr != nil {
 				if abortReason := t.currentBootAbortReason(); abortReason != "" && ctx.Err() == nil {
 					t.clearActiveBootCancel()
@@ -631,20 +735,24 @@ func (t *TunnelInstance) BootAndQualify(
 			}
 		}
 
-		// Avoid tearing down a working sole cellular tunnel just because LTE->Codespace RTT exceeds
-		// local Iranian underlay RTT when no healthy peer exists to beat it.
-		soleCellularAccept := !qRep.Accepted &&
+		// Generalized Stage-2 Slow-Network Admission: never reject/lock out a working sole tunnel
+		// (0 failures + micro-payload verified + usable <= 6000ms RTT) on bufferbloated 500 KB/s or 500 kbps links.
+		soleMaxRTTMS := t.cfg.SoleWorkingMaxRTT.Milliseconds()
+		if soleMaxRTTMS <= 0 {
+			soleMaxRTTMS = DefaultSoleWorkingMaxRTT.Milliseconds()
+		}
+		soleWorkingTunnelAccept := !qRep.Accepted &&
 			peerMedian == 0 &&
 			qRep.Failures == 0 &&
 			qRep.MicroPayloadOK &&
 			len(rtts) > 0 &&
-			qRep.Reason == "slow_lane_vs_underlay_baseline" &&
-			(t.cfg.BootQualityMaxRTT <= 0 || qRep.P50MS <= t.cfg.BootQualityMaxRTT.Milliseconds())
+			IsSlowLinkLatencyReason(qRep.Reason) &&
+			qRep.P50MS <= soleMaxRTTMS
 
 		shouldRetryQuality := !qRep.Accepted &&
-			!soleCellularAccept &&
+			!soleWorkingTunnelAccept &&
 			qualityRetries < t.cfg.BootQualityMaxRetries &&
-			(canRetry || qRep.Failures > 0 || !qRep.MicroPayloadOK)
+			(canRetry || qRep.Failures > 0 || !qRep.MicroPayloadOK || (len(rtts) > 0 && qRep.P50MS > soleMaxRTTMS))
 
 		if shouldRetryQuality {
 			qualityRetries++
@@ -689,12 +797,28 @@ func (t *TunnelInstance) BootAndQualify(
 			t.lastBootElapsedMS.Store(bootDuration.Milliseconds())
 			return nil, BootQualityReport{}, fmt.Errorf("boot qualification failed: 0/%d probes succeeded (target=%s)", samples, t.cfg.ProbeTarget)
 		}
+		if qRep.Failures > 0 || !qRep.MicroPayloadOK || (len(rtts) > 0 && qRep.P50MS > soleMaxRTTMS) {
+			_ = sess.Close()
+			t.lastBootElapsedMS.Store(bootDuration.Milliseconds())
+			return nil, BootQualityReport{}, fmt.Errorf("boot qualification failed: reason=%s failures=%d micro_ok=%v p50=%dms",
+				qRep.Reason, qRep.Failures, qRep.MicroPayloadOK, qRep.P50MS)
+		}
 
-		if !qRep.Accepted && t.logger != nil {
+		if soleWorkingTunnelAccept && t.logger != nil {
+			t.logger.Log("BOOT_QUALITY_SOLE_ACCEPT", map[string]any{
+				"tunnel_id":    t.id,
+				"reason":       qRep.Reason,
+				"p50_ms":       qRep.P50MS,
+				"jitter_ms":    qRep.JitterMS,
+				"relative_rho": qRep.RelativeRho,
+				"wan_remote":   wan,
+			})
+		} else if !qRep.Accepted && t.logger != nil {
 			t.logger.Log("BOOT_QUALITY_ACCEPTED_BEST_EFFORT", map[string]any{
 				"tunnel_id":          t.id,
 				"reason":             qRep.Reason,
 				"p50_ms":             qRep.P50MS,
+				"jitter_ms":          qRep.JitterMS,
 				"relative_rho":       qRep.RelativeRho,
 				"budget_constrained": !canRetry,
 				"defer_reason":       deferReason,

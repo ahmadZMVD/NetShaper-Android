@@ -74,6 +74,17 @@ const (
 	DefaultSlowLaneEvictWindow     = 30 * time.Second
 	DefaultSlowLaneUnderlayCeiling = 800 * time.Millisecond
 
+	// Stage-2 Anti-Drop Stability, Multi-Metric Routing & Low-Speed Network Resilience.
+	DefaultSlowLaneAbsoluteFloor      = 900 * time.Millisecond
+	DefaultSlowLanePeerAdvantageMS    = 250.0
+	DefaultSlowLanePeerAdvantageRatio = 1.50
+	DefaultActiveStreamLivenessWindow = 30 * time.Second
+	DefaultActiveStreamStallWindow    = 45 * time.Second
+	DefaultActiveStreamMaxErrRate     = 0.20 // strictly in (E_1=0.15, E_2=0.2775)
+	DefaultBlackholeErrRate           = 0.35 // strictly in (E_2=0.2775, E_3=0.3859)
+	DefaultSoleWorkingMaxRTT          = 6000 * time.Millisecond
+	DefaultRoutingProfile             = "balanced"
+
 	// GitHub API & WAF Guard.
 	DefaultGitHubMaxCallsPer5Min      = 6
 	DefaultGitHubMaxCallsPerHour      = 24
@@ -176,6 +187,16 @@ type Config struct {
 	SlowLaneEvictRatio           float64
 	SlowLaneEvictWindow          time.Duration
 	SlowLaneUnderlayCeiling      time.Duration
+	SlowLaneAbsoluteFloor        time.Duration
+	SlowLanePeerAdvantageMS      float64
+	SlowLanePeerAdvantageRatio   float64
+	ActiveStreamShieldEnabled    bool
+	ActiveStreamLivenessWindow   time.Duration
+	ActiveStreamStallWindow      time.Duration
+	ActiveStreamMaxErrRate       float64
+	BlackholeErrRate             float64
+	SoleWorkingMaxRTT            time.Duration
+	RoutingProfile               string
 	GitHubMaxCallsPer5Min        int
 	GitHubMaxCallsPerHour        int
 	GitHubMinCallSpacing         time.Duration
@@ -256,6 +277,16 @@ func DefaultConfig() Config {
 		SlowLaneEvictRatio:           DefaultSlowLaneEvictRatio,
 		SlowLaneEvictWindow:          DefaultSlowLaneEvictWindow,
 		SlowLaneUnderlayCeiling:      DefaultSlowLaneUnderlayCeiling,
+		SlowLaneAbsoluteFloor:        DefaultSlowLaneAbsoluteFloor,
+		SlowLanePeerAdvantageMS:      DefaultSlowLanePeerAdvantageMS,
+		SlowLanePeerAdvantageRatio:   DefaultSlowLanePeerAdvantageRatio,
+		ActiveStreamShieldEnabled:    true,
+		ActiveStreamLivenessWindow:   DefaultActiveStreamLivenessWindow,
+		ActiveStreamStallWindow:      DefaultActiveStreamStallWindow,
+		ActiveStreamMaxErrRate:       DefaultActiveStreamMaxErrRate,
+		BlackholeErrRate:             DefaultBlackholeErrRate,
+		SoleWorkingMaxRTT:            DefaultSoleWorkingMaxRTT,
+		RoutingProfile:               DefaultRoutingProfile,
 		GitHubMaxCallsPer5Min:        DefaultGitHubMaxCallsPer5Min,
 		GitHubMaxCallsPerHour:        DefaultGitHubMaxCallsPerHour,
 		GitHubMinCallSpacing:         DefaultGitHubMinCallSpacing,
@@ -394,6 +425,19 @@ func (c Config) Validate() error {
 	}
 	if c.FastLaneMaxRatio < 1.0 || c.SlowLaneEvictRatio <= c.FastLaneMaxRatio {
 		return fmt.Errorf("invalid lane ratios: fast=%.2f evict=%.2f", c.FastLaneMaxRatio, c.SlowLaneEvictRatio)
+	}
+	rp := strings.ToLower(strings.TrimSpace(c.RoutingProfile))
+	if rp != "" && rp != "balanced" && rp != "sticky" {
+		return fmt.Errorf("invalid routing-profile %q (must be \"balanced\" or \"sticky\")", c.RoutingProfile)
+	}
+	if c.ActiveStreamMaxErrRate < 0 || c.ActiveStreamMaxErrRate > 1.0 {
+		return fmt.Errorf("active-stream-max-err-rate must be in [0, 1], got %.2f", c.ActiveStreamMaxErrRate)
+	}
+	if c.BlackholeErrRate < 0 || c.BlackholeErrRate > 1.0 {
+		return fmt.Errorf("blackhole-err-rate must be in [0, 1], got %.2f", c.BlackholeErrRate)
+	}
+	if c.SlowLanePeerAdvantageRatio > 0 && c.SlowLanePeerAdvantageRatio < 1.0 {
+		return fmt.Errorf("slow-lane-peer-advantage-ratio must be >= 1.0, got %.2f", c.SlowLanePeerAdvantageRatio)
 	}
 	for _, t := range c.ParsedUnderlayTargets() {
 		if IsGitHubHost(t) {

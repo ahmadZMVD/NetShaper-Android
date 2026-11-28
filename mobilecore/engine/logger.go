@@ -465,6 +465,12 @@ func FormatLogRecord(rec LogRecord) (LogSeverity, string) {
 		return LogWarn, fmt.Sprintf("[Pool] slow-lane evict %s rtt=%sms rho=%s", sf("tunnel_id"), sf("ewma_rtt_ms"), sf("relative_rho"))
 	case "WORKER_SLOW_LANE_EVICT_DEFERRED":
 		return LogWarn, fmt.Sprintf("[Pool] slow-lane evict deferred (%s) for %s", sf("defer_reason"), sf("tunnel_id"))
+	case "WORKER_SLOW_LANE_SOFT_DRAIN":
+		return LogInfo, fmt.Sprintf("[Pool] %s soft-drained (active=%s rtt=%sms err=%s) — protecting live streams",
+			sf("tunnel_id"), sf("active_conns"), sf("ewma_rtt_ms"), sf("stream_err_rate"))
+	case "BOOT_QUALITY_SOLE_ACCEPT":
+		return LogInfo, fmt.Sprintf("[Boot] %s accepted on slow link (reason=%s p50=%sms jitter=%sms)",
+			sf("tunnel_id"), sf("reason"), sf("p50_ms"), sf("jitter_ms"))
 	case "NETWORK_CHANGE":
 		return LogInfo, fmt.Sprintf("[Net] handover type=%s metered=%s action=%s", sf("network_type"), sf("is_metered"), sf("action"))
 	case "SUSPEND_CLOCK_JUMP":

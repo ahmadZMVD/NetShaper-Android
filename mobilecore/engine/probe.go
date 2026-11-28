@@ -300,6 +300,23 @@ func EvaluateFastLaneGate(
 	return rep
 }
 
+// IsSlowLinkLatencyReason reports whether EvaluateFastLaneGateNormalized rejected solely due
+// to latency/jitter/lane-ratio thresholds while probes and micro-payload data transit succeeded.
+func IsSlowLinkLatencyReason(reason string) bool {
+	switch reason {
+	case "slow_lane_vs_underlay_baseline",
+		"idle_jitter_exceeded",
+		"slow_boot_elevated_jitter",
+		"slow_boot_elevated_rtt",
+		"idle_rtt_exceeded",
+		"mci_slow_lane_detected",
+		"slow_lane_vs_peer":
+		return true
+	default:
+		return false
+	}
+}
+
 // EvaluateFastLaneGateNormalized preserves 100% parity with Windows v6.4 baseline-normalized boot qualification.
 func EvaluateFastLaneGateNormalized(
 	cfg Config,

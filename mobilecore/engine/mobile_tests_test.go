@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2731,5 +2732,839 @@ func TestMT26_ZeroDuplicateWorkerBootFailLogsAndCleanOfflineExit(t *testing.T) {
 	})
 
 	ctrlB.StopAndWait(4 * time.Second)
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+// =============================================================================
+// Stage-2 Helper: Deterministic Token-Bucket Slow-Link Wrapper (500 KB/s & 500 kbps)
+// =============================================================================
+
+type throttledConn struct {
+	net.Conn
+	bytesPerSec int64
+	mu          sync.Mutex
+	nextReadAt  time.Time
+	nextWriteAt time.Time
+}
+
+func newThrottledConn(c net.Conn, bytesPerSec int64) *throttledConn {
+	return &throttledConn{Conn: c, bytesPerSec: bytesPerSec}
+}
+
+func (t *throttledConn) pace(n int, isWrite bool) {
+	if t.bytesPerSec <= 0 || n <= 0 {
+		return
+	}
+	dur := time.Duration(int64(n)*int64(time.Second)/t.bytesPerSec) / 2
+	if dur <= 0 {
+		return
+	}
+	t.mu.Lock()
+	now := time.Now()
+	slot := &t.nextReadAt
+	if isWrite {
+		slot = &t.nextWriteAt
+	}
+	if slot.Before(now) {
+		*slot = now
+	}
+	*slot = slot.Add(dur)
+	wait := slot.Sub(now)
+	t.mu.Unlock()
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
+func (t *throttledConn) Read(p []byte) (int, error) {
+	n, err := t.Conn.Read(p)
+	if n > 0 {
+		t.pace(n, false)
+	}
+	return n, err
+}
+
+func (t *throttledConn) Write(p []byte) (int, error) {
+	t.pace(len(p), true)
+	return t.Conn.Write(p)
+}
+
+func (t *throttledConn) CloseWrite() error {
+	if cw, ok := t.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// =============================================================================
+// MT-27: Active-Stream Shield Zero-Drop SSE / Colab Protection + Clean Idle Eviction
+// =============================================================================
+func TestMT27_ActiveStreamShieldZeroDropSSEColabProtection(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	tr := &mockTransport{}
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt27-sse"
+	cfg.LocalPort = 0
+	cfg.PoolSize = 2
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.StopOnExit = false
+	cfg.EnableIdleParking = true
+	cfg.IdleLightAfter = 40 * time.Millisecond
+	cfg.IdleDeepAfter = 80 * time.Millisecond
+	cfg.IdleMinActiveDwell = 10 * time.Millisecond
+	cfg.SlowLaneEvictRatio = 3.5
+	cfg.SlowLaneEvictWindow = 60 * time.Millisecond
+	cfg.ActiveStreamShieldEnabled = true
+	cfg.ActiveStreamLivenessWindow = 220 * time.Millisecond
+	cfg.ActiveStreamStallWindow = 450 * time.Millisecond
+	cfg.SlowLaneAbsoluteFloor = 900 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	var t1RTTNS atomic.Int64
+	var t2RTTNS atomic.Int64
+	t1RTTNS.Store(int64(320 * time.Millisecond))
+	t2RTTNS.Store(int64(210 * time.Millisecond))
+
+	var rb = NewTerminalRingBuffer()
+	logger, err := NewEventLogger("", cfg.MaxLogFileBytes)
+	if err != nil {
+		t.Fatalf("MT-27 NewEventLogger: %v", err)
+	}
+	var softDrainEvents atomic.Int32
+	logger.SetObserver(func(rec LogRecord) {
+		if rec.Event == "WORKER_SLOW_LANE_SOFT_DRAIN" {
+			softDrainEvents.Add(1)
+		}
+		sev, line := FormatLogRecord(rec)
+		rb.Append(sev, line)
+	})
+	defer logger.Close()
+
+	sup := NewSupervisor(cfg, logger, SupervisorDeps{
+		Transport: tr,
+		PoolHooks: PoolHooks{
+			UnderlayProbeFunc: func(_ context.Context, _ []string, _ time.Duration) (time.Duration, string, error) {
+				return 115 * time.Millisecond, "1.1.1.1:443", nil
+			},
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 210 * time.Millisecond, nil
+			},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitUntilCond(t, 4*time.Second, "MT-27 2/2 HEALTHY", func() bool {
+		return sup.State() == StateHealthy && sup.AtomicPoolSnapshot().HealthyWorkers == 2
+	})
+
+	sup.poolMu.Lock()
+	pool := sup.activePool
+	sup.poolMu.Unlock()
+	w1 := pool.workers[0]
+	w2 := pool.workers[1]
+	w1.SetEWMARTT(time.Duration(t1RTTNS.Load()))
+	w2.SetEWMARTT(time.Duration(t2RTTNS.Load()))
+
+	// Pin an active SSE/Colab stream onto tunnel-2 (currently lower RTT than tunnel-1).
+	sseConn, err := net.DialTimeout("tcp", sup.AtomicBoundLocalAddr(), 2*time.Second)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("MT-27 SSE dial: %v", err)
+	}
+	_ = sseConn.SetDeadline(time.Now().Add(8 * time.Second))
+	_, _ = sseConn.Write([]byte{0x05, 0x01, 0x00})
+	var mrep [2]byte
+	_, _ = io.ReadFull(sseConn, mrep[:])
+	dom := "aistudio.google.com"
+	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(dom))}, dom...)
+	req = append(req, 0x01, 0xbb)
+	_, _ = sseConn.Write(req)
+	var srep [10]byte
+	if _, err := io.ReadFull(sseConn, srep[:]); err != nil || srep[1] != 0x00 {
+		_ = sseConn.Close()
+		cancel()
+		<-done
+		t.Fatalf("MT-27 SSE SOCKS5 connect failed: err=%v rep=%v", err, srep)
+	}
+	waitUntilCond(t, 2*time.Second, "MT-27 SSE stream active on tunnel-2", func() bool {
+		return w2.ActiveConns() == 1
+	})
+
+	// Replay 18.txt: tunnel-1 becomes fast (220ms), tunnel-2 hits 435ms (rho=3.78) then 1150ms (rho=10.0)!
+	w1.SetEWMARTT(220 * time.Millisecond)
+	w2.SetEWMARTT(435 * time.Millisecond)
+	pool.CheckSlowLaneEviction(time.Now())
+
+	// Stream ticks SSE tokens every 25ms across > 10x SlowLaneEvictWindow (650ms) including a 260ms AI thinking silence (<450ms)!
+	totalSent := 0
+	for i := 0; i < 16; i++ {
+		w1.SetEWMARTT(220 * time.Millisecond)
+		if i == 4 {
+			w2.SetEWMARTT(1150 * time.Millisecond) // Worsen well past 900ms floor while stream is alive!
+		}
+		chunk := []byte(fmt.Sprintf("data: token-%02d\n\n", i))
+		if _, werr := sseConn.Write(chunk); werr != nil {
+			_ = sseConn.Close()
+			cancel()
+			<-done
+			t.Fatalf("MT-27 active SSE stream dropped on chunk %d: %v", i, werr)
+		}
+		got := make([]byte, len(chunk))
+		if _, rerr := io.ReadFull(sseConn, got); rerr != nil || !bytes.Equal(got, chunk) {
+			_ = sseConn.Close()
+			cancel()
+			<-done
+			t.Fatalf("MT-27 active SSE read failed on chunk %d: err=%v", i, rerr)
+		}
+		totalSent += len(chunk)
+		if i == 8 {
+			time.Sleep(260 * time.Millisecond) // AI reasoning pause (> livenessWindow 220ms, < stallWindow 450ms)
+		} else {
+			time.Sleep(30 * time.Millisecond)
+		}
+		pool.CheckSlowLaneEviction(time.Now())
+	}
+
+	if !w2.IsSlowLaneDegraded() {
+		_ = sseConn.Close()
+		cancel()
+		<-done
+		t.Fatal("MT-27 expected tunnel-2 to be Soft-Demoted (SlowLaneDegraded=true)")
+	}
+	if pool.SlowLaneEvictions() != 0 {
+		_ = sseConn.Close()
+		cancel()
+		<-done
+		t.Fatalf("MT-27 Active-Stream Shield failed: expected 0 destructive evictions, got %d", pool.SlowLaneEvictions())
+	}
+	if pool.PowerState() != PowerActive {
+		_ = sseConn.Close()
+		cancel()
+		<-done
+		t.Fatalf("MT-27 IDLE_DEEP must not park tunnel-2 while SSE stream active: power=%s", pool.PowerState())
+	}
+	if softDrainEvents.Load() < 1 {
+		_ = sseConn.Close()
+		cancel()
+		<-done
+		t.Fatal("MT-27 expected WORKER_SLOW_LANE_SOFT_DRAIN log event")
+	}
+
+	// Verify 100% of new dials route to tunnel-1 while tunnel-2 stays soft-demoted!
+	routed2Before := w2.totalRouted.Load()
+	routed1Before := w1.totalRouted.Load()
+	for i := 0; i < 10; i++ {
+		if err := performSOCKS5DomainEcho(sup.AtomicBoundLocalAddr(), fmt.Sprintf("newdial-%d.example.com", i), 443, []byte("fast-peer"), 2*time.Second); err != nil {
+			_ = sseConn.Close()
+			cancel()
+			<-done
+			t.Fatalf("MT-27 new dial %d failed: %v", i, err)
+		}
+	}
+	if w2.totalRouted.Load() != routed2Before || w1.totalRouted.Load() < routed1Before+10 {
+		_ = sseConn.Close()
+		cancel()
+		<-done
+		t.Fatalf("MT-27 new dials leaked onto soft-demoted tunnel-2: t1Delta=%d t2Delta=%d",
+			w1.totalRouted.Load()-routed1Before, w2.totalRouted.Load()-routed2Before)
+	}
+
+	// Close SSE stream cleanly (0 bytes lost) and verify clean idle eviction fires once ActiveConns == 0!
+	_ = sseConn.Close()
+	waitUntilCond(t, 2*time.Second, "MT-27 tunnel-2 ActiveConns returns to 0", func() bool {
+		return w2.ActiveConns() == 0
+	})
+	w1.SetEWMARTT(220 * time.Millisecond)
+	w2.SetEWMARTT(1150 * time.Millisecond)
+	waitUntilCond(t, 3*time.Second, "MT-27 clean idle eviction fires after stream finishes", func() bool {
+		pool.CheckSlowLaneEviction(time.Now())
+		return pool.SlowLaneEvictions() == 1
+	})
+
+	cancel()
+	<-done
+	_ = logger.Close()
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+// =============================================================================
+// MT-28: Blackholed Stream Shield Override & Single-Error Geometric Immunity
+// =============================================================================
+func TestMT28_BlackholedStreamShieldOverrideAndSingleErrorImmunity(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+
+	cfg := DefaultConfig()
+	cfg.PoolSize = 2
+	cfg.SlowLaneEvictRatio = 3.5
+	cfg.SlowLaneEvictWindow = 40 * time.Millisecond
+	cfg.ActiveStreamShieldEnabled = true
+	cfg.ActiveStreamLivenessWindow = 120 * time.Millisecond
+	cfg.ActiveStreamStallWindow = 180 * time.Millisecond
+	cfg.ActiveStreamMaxErrRate = 0.20
+	cfg.BlackholeErrRate = 0.35
+	cfg.SlowLaneAbsoluteFloor = 900 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	// Part A: Single isolated error (E_1 = 0.15 < 0.20) MUST keep Active-Stream Shield armed!
+	pool := NewTunnelPool(cfg, &mockTransport{}, nil, nil, NewGitHubGuard(cfg, nil, nil), PoolHooks{})
+	pool.SetUnderlayBaselineMS(115.0)
+	w1, w2 := pool.workers[0], pool.workers[1]
+	w1.setState(TunnelHealthy)
+	w2.setState(TunnelHealthy)
+	w1.SetEWMARTT(220 * time.Millisecond)
+	w2.SetEWMARTT(1300 * time.Millisecond)
+	w2.TryAcquireSlotWithCap(32)
+	w2.RecordWANBytes(2048)
+
+	w2.RecordStreamError() // E_1 = 0.15 < 0.20
+	if got := w2.StreamErrorRate(); got < 0.149 || got > 0.151 {
+		t.Fatalf("MT-28A expected E_1=0.15, got %.4f", got)
+	}
+	now := time.Now()
+	if !w2.IsActivelyFlowing(now, cfg.ActiveStreamLivenessWindow, cfg.ActiveStreamMaxErrRate) {
+		t.Fatal("MT-28A single isolated error (0.15 < 0.20) falsely disarmed IsActivelyFlowing")
+	}
+	pool.CheckSlowLaneEviction(now)
+	if n := pool.CheckSlowLaneEviction(now.Add(60 * time.Millisecond)); n != 0 || !w2.IsSlowLaneDegraded() || w2.IsEvictionTriggered() {
+		t.Fatalf("MT-28A single isolated error falsely evicted active stream: n=%d slow=%v trig=%v",
+			n, w2.IsSlowLaneDegraded(), w2.IsEvictionTriggered())
+	}
+
+	// Part B: Stale WAN bytes >= ActiveStreamStallWindow -> IsStreamBlackholed() overrides shield & evicts!
+	w2.RecordStreamSuccess() // clear error rate well below 0.20
+	staleAt := now.Add(220 * time.Millisecond)
+	if !w2.IsStreamBlackholed(staleAt, cfg.ActiveStreamStallWindow, cfg.BlackholeErrRate) {
+		t.Fatal("MT-28B expected IsStreamBlackholed()==true when WAN bytes stale >= ActiveStreamStallWindow")
+	}
+	if n := pool.CheckSlowLaneEviction(staleAt); n != 1 || !w2.IsEvictionTriggered() {
+		t.Fatalf("MT-28B blackholed stale-bytes stream was not evicted: n=%d trig=%v", n, w2.IsEvictionTriggered())
+	}
+
+	// Part C: 3 consecutive stream errors (E_3 = 0.3859 >= 0.35) -> IsStreamBlackholed() overrides even fresh WAN bytes!
+	poolC := NewTunnelPool(cfg, &mockTransport{}, nil, nil, NewGitHubGuard(cfg, nil, nil), PoolHooks{})
+	poolC.SetUnderlayBaselineMS(115.0)
+	c1, c2 := poolC.workers[0], poolC.workers[1]
+	c1.setState(TunnelHealthy)
+	c2.setState(TunnelHealthy)
+	c1.SetEWMARTT(220 * time.Millisecond)
+	c2.SetEWMARTT(1300 * time.Millisecond)
+	c2.TryAcquireSlotWithCap(32)
+	c2.RecordWANBytes(4096)
+
+	c2.RecordStreamError()
+	c2.RecordStreamError()
+	c2.RecordStreamError() // E_3 = 0.385875 >= 0.35
+	if c2.StreamErrorRate() < 0.38 {
+		t.Fatalf("MT-28C expected E_3 >= 0.38, got %.4f", c2.StreamErrorRate())
+	}
+	nowC := time.Now()
+	if !c2.IsStreamBlackholed(nowC, cfg.ActiveStreamStallWindow, cfg.BlackholeErrRate) {
+		t.Fatal("MT-28C expected IsStreamBlackholed()==true after 3 consecutive stream errors")
+	}
+	poolC.CheckSlowLaneEviction(nowC)
+	if n := poolC.CheckSlowLaneEviction(nowC.Add(60 * time.Millisecond)); n != 1 || !c2.IsEvictionTriggered() {
+		t.Fatalf("MT-28C blackholed 3-error stream was not evicted: n=%d trig=%v", n, c2.IsEvictionTriggered())
+	}
+
+	assertGoroutinesClean(t, baseG, 8)
+}
+
+// =============================================================================
+// MT-29: Slow Iranian Wi-Fi (500 KB/s & 500 kbps) + Bufferbloat Boot Admission
+// =============================================================================
+func TestMT29_SlowWiFi500KBpsAnd500KbpsBufferbloatBootAdmission(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+
+	// Part A: Replay 10.txt (22:51:55 idle_jitter_exceeded) on 500 KB/s link -> Attempt-1 sole acceptance!
+	cfgA := DefaultConfig()
+	cfgA.CodespaceName = "mt29-500kbps-b"
+	cfgA.BootQualitySamples = 3
+	cfgA.BootQualityMaxRetries = 2
+	cfgA.BootMicroPayloadCheck = true
+	cfgA.SoleWorkingMaxRTT = 6000 * time.Millisecond
+
+	loggerA, err := NewEventLogger("", cfgA.MaxLogFileBytes)
+	if err != nil {
+		t.Fatalf("MT-29A NewEventLogger: %v", err)
+	}
+	rbA := NewTerminalRingBuffer()
+	loggerA.SetObserver(func(rec LogRecord) {
+		sev, line := FormatLogRecord(rec)
+		rbA.Append(sev, line)
+	})
+
+	var connectsA atomic.Int32
+	trA := &mockTransport{
+		onConn: func(workerID string, seq int64) (*mockWorkerSession, error) {
+			connectsA.Add(1)
+			return newMockWorkerSession("20.120.56.11:443"), nil
+		},
+	}
+	rtts500KB := []time.Duration{480 * time.Millisecond, 1420 * time.Millisecond, 560 * time.Millisecond} // jitter = 940ms (> 700ms!)
+	var probeIdxA atomic.Int32
+	tiA := NewTunnelInstance(
+		"tunnel-1",
+		cfgA,
+		trA,
+		func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+			i := int(probeIdxA.Add(1)-1) % len(rtts500KB)
+			return rtts500KB[i], nil
+		},
+		func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+			return 520 * time.Millisecond, nil
+		},
+		loggerA,
+		nil,
+		NewGitHubGuard(cfgA, nil, nil),
+	)
+	tiA.sampleDel = time.Millisecond
+	tiA.retryDel = 2 * time.Millisecond
+
+	sessA, repA, err := tiA.BootAndQualify(context.Background(), func(string) float64 { return 0 }, func() float64 { return 115.0 })
+	if err != nil {
+		_ = loggerA.Close()
+		t.Fatalf("MT-29A 500 KB/s sole working tunnel rejected: %v", err)
+	}
+	_ = sessA.Close()
+	_ = loggerA.Close()
+	if connectsA.Load() != 1 {
+		t.Fatalf("MT-29A expected Attempt-1 admission (1 Connect), got %d (reason=%s p50=%d jitter=%d)",
+			connectsA.Load(), repA.Reason, repA.P50MS, repA.JitterMS)
+	}
+	sawSoleAccept := false
+	for _, ln := range rbA.Since(0) {
+		if strings.Contains(ln.Text, "accepted on slow link") && strings.Contains(ln.Text, "idle_jitter_exceeded") {
+			sawSoleAccept = true
+			break
+		}
+	}
+	if !sawSoleAccept {
+		t.Fatal("MT-29A expected BOOT_QUALITY_SOLE_ACCEPT log for idle_jitter_exceeded")
+	}
+
+	// Part B: Full Supervisor pool on extreme 500 kbps (62.5 KB/s) throttled relay with 1050ms jitter & 1950ms peak RTT.
+	throttledTr := &ctxAwareFuncTransport{
+		fn: func(_ context.Context, _ string) (WorkerSession, error) {
+			base := newMockWorkerSession("20.120.56.11:443")
+			return &throttledWorkerSession{WorkerSession: base, bytesPerSec: 62_500}, nil
+		},
+	}
+	cfgB := DefaultConfig()
+	cfgB.CodespaceName = "mt29-500kbps"
+	cfgB.LocalPort = 0
+	cfgB.PoolSize = 2
+	cfgB.BootQualitySamples = 3
+	cfgB.BootQualityMaxRetries = 2
+	cfgB.BootMicroPayloadCheck = true
+	cfgB.SoleWorkingMaxRTT = 6000 * time.Millisecond
+	cfgB.StopOnExit = false
+	cfgB.GitHubMinCallSpacing = 0
+
+	rtts500kb := []time.Duration{900 * time.Millisecond, 1950 * time.Millisecond, 1100 * time.Millisecond} // P50=1100ms, Jitter=1050ms
+	var probeIdxB atomic.Int32
+	sup := NewSupervisor(cfgB, nil, SupervisorDeps{
+		Transport: throttledTr,
+		PoolHooks: PoolHooks{
+			UnderlayProbeFunc: func(_ context.Context, _ []string, _ time.Duration) (time.Duration, string, error) {
+				return 115 * time.Millisecond, "1.1.1.1:443", nil
+			},
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				i := int(probeIdxB.Add(1)-1) % len(rtts500kb)
+				return rtts500kb[i], nil
+			},
+			MicroPayloadProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 1150 * time.Millisecond, nil
+			},
+			SampleDelay: 2 * time.Millisecond,
+			RetryDelay:  5 * time.Millisecond,
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitUntilCond(t, 6*time.Second, "MT-29B 500 kbps pool reaches 2/2 HEALTHY", func() bool {
+		return sup.State() == StateHealthy && sup.AtomicPoolSnapshot().HealthyWorkers == 2
+	})
+
+	payload := makeTestPayload(24*1024, 0x77) // ~0.4s wire time at 62.5 KB/s
+	if err := performSOCKS5DomainEcho(sup.AtomicBoundLocalAddr(), "slow-500kbps.example.com", 443, payload, 6*time.Second); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("MT-29B 500 kbps SOCKS5 echo failed: %v", err)
+	}
+
+	cancel()
+	<-done
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+type throttledWorkerSession struct {
+	WorkerSession
+	bytesPerSec int64
+}
+
+func (s *throttledWorkerSession) DialTarget(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	c, err := s.WorkerSession.DialTarget(ctx, host, port)
+	if err != nil {
+		return nil, err
+	}
+	return newThrottledConn(c, s.bytesPerSec), nil
+}
+
+// =============================================================================
+// MT-30: Multi-Metric Composite Routing & Sticky Profile (60s Dwell, Zero Idle Churn)
+// =============================================================================
+func TestMT30_MultiMetricCompositeRoutingAndStickyProfile(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+
+	// Part A: Lossy low-RTT (210ms, err>=0.25) MUST lose primary to clean higher-RTT (320ms, err=0.0)!
+	cfgA := DefaultConfig()
+	cfgA.PoolSize = 2
+	cfgA.RoutingProfile = "balanced"
+	poolA := NewTunnelPool(cfgA, &mockTransport{}, nil, nil, NewGitHubGuard(cfgA, nil, nil), PoolHooks{})
+	poolA.SetUnderlayBaselineMS(115.0)
+	w1, w2 := poolA.workers[0], poolA.workers[1]
+	w1.setState(TunnelHealthy)
+	w2.setState(TunnelHealthy)
+	w1.SetEWMARTT(210 * time.Millisecond)
+	w2.SetEWMARTT(320 * time.Millisecond)
+	w1.ewmaJitterBits.Store(math.Float64bits(20.0))
+	w2.ewmaJitterBits.Store(math.Float64bits(25.0))
+	w1.streamErrRateBit.Store(math.Float64bits(0.25))
+	w2.streamErrRateBit.Store(math.Float64bits(0.0))
+
+	if q1, q2 := w1.QualityScore(115.0), w2.QualityScore(115.0); !(q2 < q1) {
+		t.Fatalf("MT-30A expected clean 320ms Q2 (%.2f) < lossy 210ms Q1 (%.2f)", q2, q1)
+	}
+	now := time.Now()
+	poolA.EvaluateRoutingMode(now)
+	if mode, pri := poolA.RoutingMode(); mode != "primary_preferred" || pri != "tunnel-2" {
+		t.Fatalf("MT-30A expected lossy tunnel-1 demoted in favor of tunnel-2, got mode=%s pri=%s", mode, pri)
+	}
+
+	// Part B: Sticky profile enforces >= 60s dwell & blocks non-blackholed idle eviction while still rescuing blackholes!
+	cfgB := DefaultConfig()
+	cfgB.PoolSize = 2
+	cfgB.RoutingProfile = "sticky"
+	cfgB.HysteresisDwellWindow = 25 * time.Second
+	cfgB.SlowLaneEvictRatio = 3.5
+	cfgB.SlowLaneEvictWindow = 30 * time.Second
+	cfgB.ActiveStreamStallWindow = 45 * time.Second
+	cfgB.SlowLaneAbsoluteFloor = 900 * time.Millisecond
+	cfgB.GitHubMinCallSpacing = 0
+
+	poolB := NewTunnelPool(cfgB, &mockTransport{}, nil, nil, NewGitHubGuard(cfgB, nil, nil), PoolHooks{})
+	poolB.SetUnderlayBaselineMS(115.0)
+	s1, s2 := poolB.workers[0], poolB.workers[1]
+	s1.setState(TunnelHealthy)
+	s2.setState(TunnelHealthy)
+	s1.SetEWMARTT(200 * time.Millisecond)
+	s2.SetEWMARTT(360 * time.Millisecond) // rho=3.13 <= 3.5, relGain=0.44 >= 0.40, absGain=160ms >= 80ms
+
+	poolB.EvaluateRoutingMode(now)
+	poolB.EvaluateRoutingMode(now.Add(30 * time.Second))
+	if mode, _ := poolB.RoutingMode(); mode != "balanced" {
+		t.Fatalf("MT-30B sticky profile promoted before 60s dwell: %s", mode)
+	}
+	poolB.EvaluateRoutingMode(now.Add(61 * time.Second))
+	if mode, pri := poolB.RoutingMode(); mode != "primary_preferred" || pri != "tunnel-1" {
+		t.Fatalf("MT-30B sticky profile did not promote after 60s dwell: mode=%s pri=%s", mode, pri)
+	}
+
+	// Slow idle s2 in sticky mode -> Soft Demoted ONLY, 0 destructive evictions!
+	s2.SetEWMARTT(1200 * time.Millisecond)
+	poolB.CheckSlowLaneEviction(now)
+	if n := poolB.CheckSlowLaneEviction(now.Add(35 * time.Second)); n != 0 || !s2.IsSlowLaneDegraded() || poolB.SlowLaneEvictions() != 0 {
+		t.Fatalf("MT-30B sticky profile evicted non-blackholed idle tunnel: n=%d slow=%v evicts=%d",
+			n, s2.IsSlowLaneDegraded(), poolB.SlowLaneEvictions())
+	}
+
+	// Blackholed active s2 in sticky mode -> STILL evicted to rescue user!
+	s2.TryAcquireSlotWithCap(32)
+	s2.RecordWANBytes(1024)
+	if n := poolB.CheckSlowLaneEviction(now.Add(50 * time.Second)); n != 1 || !s2.IsEvictionTriggered() {
+		t.Fatalf("MT-30B sticky profile failed blackhole rescue eviction: n=%d trig=%v", n, s2.IsEvictionTriggered())
+	}
+
+	assertGoroutinesClean(t, baseG, 8)
+}
+
+// =============================================================================
+// MT-31: Dual-Degraded Anti-Starvation & Bidirectional Upstream NotifyWANBytes
+// =============================================================================
+func TestMT31_DualDegradedAntiStarvationAndBidirectionalWANBytes(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+
+	// Part A: ISP-wide peak congestion pushes BOTH workers > 1000ms vs 115ms -> 0 evictions, 0 starvation!
+	cfgA := DefaultConfig()
+	cfgA.PoolSize = 2
+	cfgA.SlowLaneEvictRatio = 3.5
+	cfgA.SlowLaneEvictWindow = 20 * time.Millisecond
+	pool := NewTunnelPool(cfgA, &mockTransport{}, nil, nil, NewGitHubGuard(cfgA, nil, nil), PoolHooks{})
+	pool.SetUnderlayBaselineMS(115.0)
+	w1, w2 := pool.workers[0], pool.workers[1]
+	w1.setState(TunnelHealthy)
+	w2.setState(TunnelHealthy)
+	w2.SetSlowLaneDegraded(true)
+	w1.SetEWMARTT(1050 * time.Millisecond)
+	w2.SetEWMARTT(1120 * time.Millisecond)
+
+	now := time.Now()
+	pool.CheckSlowLaneEviction(now)
+	if n := pool.CheckSlowLaneEviction(now.Add(40 * time.Millisecond)); n != 0 || pool.SlowLaneEvictions() != 0 {
+		t.Fatalf("MT-31A dual-congested pool triggered eviction: n=%d evicts=%d", n, pool.SlowLaneEvictions())
+	}
+	if w1.IsSlowLaneDegraded() || w2.IsSlowLaneDegraded() {
+		t.Fatalf("MT-31A anti-starvation guard did not clear SlowLaneDegraded flags: w1=%v w2=%v",
+			w1.IsSlowLaneDegraded(), w2.IsSlowLaneDegraded())
+	}
+	for i := 0; i < 4; i++ {
+		lease, lerr := pool.AcquireEndpoint(context.Background())
+		if lerr != nil {
+			t.Fatalf("MT-31A AcquireEndpoint starved on attempt %d: %v", i, lerr)
+		}
+		lease.Release()
+	}
+
+	// Part B: Pure upstream upload (0 downstream bytes sent) updates TotalWANBytes & LastWANBytesAt!
+	sinkDone := make(chan uint64, 1)
+	sinkTr := &ctxAwareFuncTransport{
+		fn: func(_ context.Context, _ string) (WorkerSession, error) {
+			return &uploadSinkSession{WorkerSession: newMockWorkerSession("20.120.56.11:443"), sinkDone: sinkDone}, nil
+		},
+	}
+	cfgB := DefaultConfig()
+	cfgB.CodespaceName = "mt31-upload"
+	cfgB.LocalPort = 0
+	cfgB.PoolSize = 1
+	cfgB.BootQualitySamples = 1
+	cfgB.BootMicroPayloadCheck = false
+	cfgB.StopOnExit = false
+
+	sup := NewSupervisor(cfgB, nil, SupervisorDeps{
+		Transport: sinkTr,
+		PoolHooks: PoolHooks{
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 120 * time.Millisecond, nil
+			},
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitUntilCond(t, 4*time.Second, "MT-31B pool 1/1 healthy", func() bool {
+		return sup.State() == StateHealthy && sup.AtomicPoolSnapshot().HealthyWorkers == 1
+	})
+
+	sup.poolMu.Lock()
+	uw := sup.activePool.workers[0]
+	sup.poolMu.Unlock()
+	if uw.TotalWANBytes() != 0 || !uw.LastWANBytesAt().IsZero() {
+		cancel()
+		<-done
+		t.Fatalf("MT-31B expected zero initial WAN bytes, got total=%d at=%v", uw.TotalWANBytes(), uw.LastWANBytesAt())
+	}
+
+	upPayload := makeTestPayload(64*1024, 0x99)
+	c, err := net.DialTimeout("tcp", sup.AtomicBoundLocalAddr(), 2*time.Second)
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("MT-31B dial: %v", err)
+	}
+	_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+	_, _ = c.Write([]byte{0x05, 0x01, 0x00})
+	var m [2]byte
+	_, _ = io.ReadFull(c, m[:])
+	dom := "upload-only.example.com"
+	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(dom))}, dom...)
+	req = append(req, 0x01, 0xbb)
+	_, _ = c.Write(req)
+	var rep [10]byte
+	_, _ = io.ReadFull(c, rep[:])
+	if _, err := c.Write(upPayload); err != nil {
+		_ = c.Close()
+		cancel()
+		<-done
+		t.Fatalf("MT-31B upload write failed: %v", err)
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
+	_, _ = io.ReadAll(c)
+	_ = c.Close()
+
+	select {
+	case sinkBytes := <-sinkDone:
+		if sinkBytes != uint64(len(upPayload)) {
+			cancel()
+			<-done
+			t.Fatalf("MT-31B upload sink mismatch: got=%d want=%d", sinkBytes, len(upPayload))
+		}
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("MT-31B timed out waiting for upload sink")
+	}
+
+	if uw.TotalWANBytes() < uint64(len(upPayload)) || uw.LastWANBytesAt().IsZero() {
+		cancel()
+		<-done
+		t.Fatalf("MT-31B upstream chunks did not update WAN telemetry: total=%d at=%v", uw.TotalWANBytes(), uw.LastWANBytesAt())
+	}
+
+	cancel()
+	<-done
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+type uploadSinkSession struct {
+	WorkerSession
+	sinkDone chan uint64
+}
+
+func (s *uploadSinkSession) DialTarget(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		defer ln.Close()
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer c.Close()
+		n, _ := io.Copy(io.Discard, c)
+		select {
+		case s.sinkDone <- uint64(n):
+		default:
+		}
+	}()
+	return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "tcp", ln.Addr().String())
+}
+
+// =============================================================================
+// MT-32: Stage-1 CSFB Handover + Stage-2 Active-Stream Shield Coexistence
+// =============================================================================
+func TestMT32_Stage1PlusStage2CombinedHandoverWithActiveStreams(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	tr := &mockTransport{}
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt32-s1-s2"
+	cfg.LocalPort = 0
+	cfg.PoolSize = 2
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.StopOnExit = false
+	cfg.NetworkDebounceInterval = 70 * time.Millisecond
+	cfg.BackoffMin = 20 * time.Millisecond
+	cfg.BackoffMax = 40 * time.Millisecond
+	cfg.SlowLaneEvictRatio = 3.5
+	cfg.SlowLaneEvictWindow = 50 * time.Millisecond
+	cfg.ActiveStreamShieldEnabled = true
+	cfg.ActiveStreamLivenessWindow = 250 * time.Millisecond
+	cfg.ActiveStreamStallWindow = 450 * time.Millisecond
+	cfg.SlowLaneAbsoluteFloor = 900 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	ctrl := NewSessionController(cfg, ControllerCallbacks{}, ControllerOverrides{
+		TransportFactory: func(_ Config, _ *CredentialManager, _ *AntiPoisonResolver, _ *HeartbeatCoordinator, _ *EventLogger) WorkerTransport {
+			return tr
+		},
+		PoolHooks: PoolHooks{
+			UnderlayProbeFunc: func(_ context.Context, _ []string, _ time.Duration) (time.Duration, string, error) {
+				return 115 * time.Millisecond, "1.1.1.1:443", nil
+			},
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 200 * time.Millisecond, nil
+			},
+		},
+		SnapshotInterval: 40 * time.Millisecond,
+	})
+	ctrl.NotifyNetworkChange("cellular", true)
+	ctrl.Start()
+	defer ctrl.StopAndWait(4 * time.Second)
+
+	waitUntilCond(t, 4*time.Second, "MT-32 initial 2/2 on cellular", func() bool {
+		s := ctrl.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+
+	sup := ctrl.activeSup.Load()
+	sup.poolMu.Lock()
+	pool := sup.activePool
+	sup.poolMu.Unlock()
+	w1, w2 := pool.workers[0], pool.workers[1]
+	w1.SetEWMARTT(320 * time.Millisecond)
+	w2.SetEWMARTT(200 * time.Millisecond)
+
+	// Open active SSE stream pinned to tunnel-2, then arm Stage-2 Active-Stream Shield on tunnel-2.
+	sseConn, err := net.DialTimeout("tcp", ctrl.Snapshot().LocalAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("MT-32 dial: %v", err)
+	}
+	_ = sseConn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = sseConn.Write([]byte{0x05, 0x01, 0x00})
+	var m [2]byte
+	_, _ = io.ReadFull(sseConn, m[:])
+	dom := "gemini.google.com"
+	req := append([]byte{0x05, 0x01, 0x00, 0x03, byte(len(dom))}, dom...)
+	req = append(req, 0x01, 0xbb)
+	_, _ = sseConn.Write(req)
+	var rep [10]byte
+	_, _ = io.ReadFull(sseConn, rep[:])
+	_, _ = sseConn.Write([]byte("sse-init"))
+	var initAck [8]byte
+	_, _ = io.ReadFull(sseConn, initAck[:])
+
+	waitUntilCond(t, 2*time.Second, "MT-32 active SSE on tunnel-2", func() bool {
+		return w2.ActiveConns() == 1
+	})
+	w1.SetEWMARTT(200 * time.Millisecond)
+	w2.SetEWMARTT(1150 * time.Millisecond)
+	pool.CheckSlowLaneEviction(time.Now())
+	time.Sleep(70 * time.Millisecond)
+	pool.CheckSlowLaneEviction(time.Now())
+
+	if !w2.IsSlowLaneDegraded() || pool.SlowLaneEvictions() != 0 {
+		_ = sseConn.Close()
+		t.Fatalf("MT-32 Stage-2 shield did not soft-drain tunnel-2 cleanly: slow=%v evicts=%d",
+			w2.IsSlowLaneDegraded(), pool.SlowLaneEvictions())
+	}
+
+	// Trigger Stage-1 CSFB same-type cellular handover WHILE Stage-2 shield is armed!
+	beforeConn := tr.connects.Load()
+	tHandover := time.Now()
+	ctrl.NotifyNetworkChange("cellular", true)
+	waitUntilCond(t, 2500*time.Millisecond, "MT-32 Stage-1 CSFB handover recovers 2/2", func() bool {
+		s := ctrl.Snapshot()
+		return tr.connects.Load() >= beforeConn+2 && s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+	if time.Since(tHandover) > 2500*time.Millisecond {
+		_ = sseConn.Close()
+		t.Fatalf("MT-32 handover exceeded 2.5s budget: %s", time.Since(tHandover))
+	}
+	if ctrl.Guard().CachedSnapshot().CallsLast5Min != 0 {
+		_ = sseConn.Close()
+		t.Fatalf("MT-32 handover consumed %d GitHub calls (want 0)", ctrl.Guard().CachedSnapshot().CallsLast5Min)
+	}
+	_ = sseConn.Close()
+
+	if err := performSOCKS5DomainEcho(ctrl.Snapshot().LocalAddr, "post-csfb.example.com", 443, []byte("mt32-recovered"), 2*time.Second); err != nil {
+		t.Fatalf("MT-32 post-handover SOCKS5 echo failed: %v", err)
+	}
+
+	ctrl.StopAndWait(4 * time.Second)
 	assertGoroutinesClean(t, baseG, 10)
 }
