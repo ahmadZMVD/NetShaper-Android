@@ -7,7 +7,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -49,6 +51,48 @@ fun IecPowerGlyph(
             end = Offset(cx, stemBottom),
             strokeWidth = sw,
             cap = StrokeCap.Round
+        )
+    }
+}
+
+/**
+ * Compact crisp downward arrow drawn via custom Compose Canvas vectors.
+ */
+@Composable
+fun DownArrowGlyph(
+    modifier: Modifier = Modifier.size(18.dp),
+    color: Color = NetShaperColors.TextPrimary,
+    strokeWidth: Dp = 2.2.dp
+) {
+    Canvas(modifier = modifier) {
+        val sw = strokeWidth.toPx()
+        val cx = size.width / 2f
+        val topY = size.height * 0.22f
+        val tipY = size.height * 0.78f
+        val wingX = size.width * 0.26f
+        val wingY = tipY - size.height * 0.24f
+
+        drawLine(
+            color = color,
+            start = Offset(cx, topY),
+            end = Offset(cx, tipY - sw * 0.35f),
+            strokeWidth = sw,
+            cap = StrokeCap.Round
+        )
+
+        val chevron = Path().apply {
+            moveTo(cx - wingX, wingY)
+            lineTo(cx, tipY)
+            lineTo(cx + wingX, wingY)
+        }
+        drawPath(
+            path = chevron,
+            color = color,
+            style = Stroke(
+                width = sw,
+                cap = StrokeCap.Round,
+                join = StrokeJoin.Round
+            )
         )
     }
 }
