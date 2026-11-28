@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -40,6 +41,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
@@ -59,12 +61,27 @@ class NetShaperForegroundService : Service() {
     private val sessionGen = AtomicLong(0L)
 
     private var pollJob: Job? = null
+    private val netStateLock = Any()
     private var lastReportedNetType: String? = null
     private var lastReportedMetered: Boolean? = null
+    private var lastReportedNetHandle: Long? = null
+    private var lastReportedIpFingerprint: String? = null
 
-    @Volatile private var hasDirectUnderlay: Boolean = false
-    @Volatile private var underlayNetType: String? = null
-    @Volatile private var underlayMetered: Boolean = false
+    private var hasDirectUnderlay: Boolean = false
+    private var underlayNetType: String? = null
+    private var underlayMetered: Boolean = false
+    private var underlayNetHandle: Long? = null
+    private var underlayIpFingerprint: String? = null
+    private var defaultNetHandle: Long? = null
+    private var defaultIpFingerprint: String? = null
+
+    private data class UnderlaySnapshot(
+        val hasDirect: Boolean,
+        val type: String?,
+        val metered: Boolean,
+        val handle: Long?,
+        val ip: String?
+    )
 
     @Volatile private var isInForegroundState: Boolean = false
     private var lastNotifState: String? = null
@@ -248,31 +265,67 @@ class NetShaperForegroundService : Service() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
         NetShaperRuntime.probeCurrentVpnBypassState(this)
 
-        // 1. Track clean non-VPN physical underlay transport type + metered state without cm.allNetworks.
+        // 1. Track clean non-VPN physical underlay transport type, metered state, networkHandle & IP fingerprint without cm.allNetworks.
         val underlayReq = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
         val underlayCb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                hasDirectUnderlay = true
-                cm.getNetworkCapabilities(network)?.let { caps ->
-                    underlayNetType = mapTransportType(caps)
-                    underlayMetered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                val handle = network.networkHandle
+                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
+                val ipFp = extractLinkIpFingerprint(lp)
+                synchronized(netStateLock) {
+                    hasDirectUnderlay = true
+                    underlayNetHandle = handle
+                    if (caps != null) {
+                        underlayNetType = mapTransportType(caps)
+                        underlayMetered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                    }
+                    if (!ipFp.isNullOrEmpty()) {
+                        underlayIpFingerprint = ipFp
+                    }
+                }
+                if (caps != null) {
                     evaluateCombinedNetwork(cm)
                 }
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                hasDirectUnderlay = true
-                underlayNetType = mapTransportType(networkCapabilities)
-                underlayMetered = !networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                val handle = network.networkHandle
+                val type = mapTransportType(networkCapabilities)
+                val metered = !networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                synchronized(netStateLock) {
+                    hasDirectUnderlay = true
+                    underlayNetHandle = handle
+                    underlayNetType = type
+                    underlayMetered = metered
+                }
+                evaluateCombinedNetwork(cm)
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                val handle = network.networkHandle
+                val ipFp = extractLinkIpFingerprint(linkProperties)
+                synchronized(netStateLock) {
+                    hasDirectUnderlay = true
+                    underlayNetHandle = handle
+                    underlayIpFingerprint = ipFp
+                }
                 evaluateCombinedNetwork(cm)
             }
 
             override fun onLost(network: Network) {
-                hasDirectUnderlay = false
-                underlayNetType = null
+                val handle = network.networkHandle
+                synchronized(netStateLock) {
+                    if (underlayNetHandle == null || underlayNetHandle == handle) {
+                        hasDirectUnderlay = false
+                        underlayNetType = null
+                        underlayNetHandle = null
+                        underlayIpFingerprint = null
+                    }
+                }
                 evaluateCombinedNetwork(cm)
             }
         }
@@ -281,10 +334,17 @@ class NetShaperForegroundService : Service() {
             underlayNetCallback = underlayCb
         }
 
-        // 2. Track UID-scoped active network to detect routing loops into v2rayNG TUN immediately.
+        // 2. Track UID-scoped active network to detect routing loops & same-transport CSFB/handover IP/handle swaps immediately.
         val defaultCb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                evaluateCombinedNetwork(cm, network)
+                val handle = network.networkHandle
+                val lp = runCatching { cm.getLinkProperties(network) }.getOrNull()
+                val ipFp = extractLinkIpFingerprint(lp)
+                synchronized(netStateLock) {
+                    defaultNetHandle = handle
+                    defaultIpFingerprint = ipFp
+                }
+                evaluateCombinedNetwork(cm, network, lp)
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
@@ -294,14 +354,35 @@ class NetShaperForegroundService : Service() {
                 } else {
                     NetShaperRuntime.probeCurrentVpnBypassState(this@NetShaperForegroundService)
                 }
-                evaluateCapabilities(networkCapabilities)
+                val handle = network.networkHandle
+                val cachedIp = synchronized(netStateLock) {
+                    if (defaultNetHandle == handle) defaultIpFingerprint else null
+                }
+                evaluateCapabilities(network, networkCapabilities, cachedIp)
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                val handle = network.networkHandle
+                val ipFp = extractLinkIpFingerprint(linkProperties)
+                synchronized(netStateLock) {
+                    defaultNetHandle = handle
+                    defaultIpFingerprint = ipFp
+                }
+                evaluateCombinedNetwork(cm, network, linkProperties)
             }
 
             override fun onLost(network: Network) {
                 NetShaperRuntime.probeCurrentVpnBypassState(this@NetShaperForegroundService)
-                val activeNet = cm.activeNetwork
+                val lostHandle = network.networkHandle
+                synchronized(netStateLock) {
+                    if (defaultNetHandle == lostHandle) {
+                        defaultNetHandle = null
+                        defaultIpFingerprint = null
+                    }
+                }
+                val activeNet = runCatching { cm.activeNetwork }.getOrNull()
                 if (activeNet == null || activeNet == network) {
-                    notifyEngineNetwork("none", false)
+                    notifyEngineNetwork("none", false, null, null)
                 } else {
                     evaluateCombinedNetwork(cm, activeNet)
                 }
@@ -334,35 +415,77 @@ class NetShaperForegroundService : Service() {
 
     private fun reportInitialNetworkCapabilities() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        evaluateCombinedNetwork(cm, cm.activeNetwork)
+        evaluateCombinedNetwork(cm, runCatching { cm.activeNetwork }.getOrNull())
     }
 
-    private fun evaluateCombinedNetwork(cm: ConnectivityManager, network: Network? = cm.activeNetwork) {
+    private fun extractLinkIpFingerprint(linkProperties: LinkProperties?): String? {
+        if (linkProperties == null) return null
+        return runCatching {
+            val addrs = linkProperties.linkAddresses
+                .mapNotNull { la ->
+                    val addr: InetAddress? = la.address
+                    if (addr == null || addr.isLinkLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress) {
+                        return@mapNotNull null
+                    }
+                    addr.hostAddress?.substringBefore('%')
+                }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .sorted()
+            if (addrs.isEmpty()) null else addrs.joinToString(",")
+        }.getOrNull()
+    }
+
+    private fun evaluateCombinedNetwork(
+        cm: ConnectivityManager,
+        network: Network? = runCatching { cm.activeNetwork }.getOrNull(),
+        knownLinkProps: LinkProperties? = null
+    ) {
         NetShaperRuntime.probeCurrentVpnBypassState(this)
         if (network == null) {
-            if (hasDirectUnderlay && underlayNetType != null) {
-                notifyEngineNetwork(underlayNetType!!, underlayMetered)
+            val u = synchronized(netStateLock) {
+                UnderlaySnapshot(hasDirectUnderlay, underlayNetType, underlayMetered, underlayNetHandle, underlayIpFingerprint)
+            }
+            if (u.hasDirect && u.type != null) {
+                notifyEngineNetwork(u.type, u.metered, u.handle, u.ip)
             } else {
-                notifyEngineNetwork("none", false)
+                notifyEngineNetwork("none", false, null, null)
             }
             return
         }
-        val caps = cm.getNetworkCapabilities(network)
+        val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
         if (caps == null) {
-            notifyEngineNetwork(underlayNetType ?: "none", underlayMetered)
+            val u = synchronized(netStateLock) {
+                UnderlaySnapshot(hasDirectUnderlay, underlayNetType, underlayMetered, underlayNetHandle, underlayIpFingerprint)
+            }
+            notifyEngineNetwork(u.type ?: "none", u.metered, u.handle, u.ip)
             return
         }
-        evaluateCapabilities(caps)
+        val handle = network.networkHandle
+        val ipFp = extractLinkIpFingerprint(knownLinkProps)
+            ?: synchronized(netStateLock) {
+                if (defaultNetHandle == handle) defaultIpFingerprint else null
+            }
+            ?: extractLinkIpFingerprint(runCatching { cm.getLinkProperties(network) }.getOrNull())
+        evaluateCapabilities(network, caps, ipFp)
     }
 
-    private fun evaluateCapabilities(caps: NetworkCapabilities) {
+    private fun evaluateCapabilities(network: Network?, caps: NetworkCapabilities, directIpFp: String?) {
         var type = mapTransportType(caps)
         var metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
-        if (type == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-            type = underlayNetType
-            metered = underlayMetered
+        var netHandle: Long? = network?.networkHandle
+        var ipFp: String? = directIpFp
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            synchronized(netStateLock) {
+                if (underlayNetType != null) {
+                    type = underlayNetType
+                    metered = underlayMetered
+                    netHandle = underlayNetHandle
+                    ipFp = underlayIpFingerprint
+                }
+            }
         }
-        notifyEngineNetwork(type ?: "unknown", metered)
+        notifyEngineNetwork(type ?: "unknown", metered, netHandle, ipFp)
     }
 
     private fun mapTransportType(caps: NetworkCapabilities): String? = when {
@@ -372,14 +495,37 @@ class NetShaperForegroundService : Service() {
         else -> null
     }
 
-    private fun notifyEngineNetwork(networkType: String, isMetered: Boolean) {
-        val prevType = lastReportedNetType
-        val prevMetered = lastReportedMetered
-        if (prevType == networkType && prevMetered == isMetered) return
-        lastReportedNetType = networkType
-        lastReportedMetered = isMetered
+    private fun notifyEngineNetwork(
+        networkType: String,
+        isMetered: Boolean,
+        netHandle: Long? = null,
+        ipFingerprint: String? = null
+    ) {
+        val isHandover: Boolean
+        synchronized(netStateLock) {
+            val prevType = lastReportedNetType
+            val prevMetered = lastReportedMetered
+            val prevHandle = lastReportedNetHandle
+            val prevIp = lastReportedIpFingerprint
 
-        val isHandover = prevType != null && prevType != networkType && networkType != "none"
+            val handleChanged = prevHandle != null && netHandle != null && prevHandle != netHandle
+            val ipChanged = !prevIp.isNullOrEmpty() && !ipFingerprint.isNullOrEmpty() && prevIp != ipFingerprint
+            val sameBase = prevType == networkType && prevMetered == isMetered
+
+            if (sameBase && !handleChanged && !ipChanged) {
+                if (prevHandle == null && netHandle != null) lastReportedNetHandle = netHandle
+                if (prevIp.isNullOrEmpty() && !ipFingerprint.isNullOrEmpty()) lastReportedIpFingerprint = ipFingerprint
+                return
+            }
+
+            isHandover = prevType != null && networkType != "none" &&
+                (prevType != networkType || handleChanged || ipChanged)
+            lastReportedNetType = networkType
+            lastReportedMetered = isMetered
+            lastReportedNetHandle = netHandle
+            lastReportedIpFingerprint = ipFingerprint
+        }
+
         serviceScope.launch {
             val wl = if (isHandover) acquireBoundedWakeLock("handover", HANDOVER_WAKELOCK_MS) else null
             try {
