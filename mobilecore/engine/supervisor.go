@@ -3,9 +3,11 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,6 +97,8 @@ type Supervisor struct {
 
 	closedBytesUp   atomic.Uint64
 	closedBytesDown atomic.Uint64
+	networkTypePtr  atomic.Pointer[string]
+	isMetered       atomic.Bool
 
 	shutdownMu     sync.Mutex
 	shutdownReason string
@@ -224,6 +228,92 @@ func (s *Supervisor) NotifyHandover() {
 		pool.SetPausedOffline(false)
 		pool.ForceReconnectForHandover()
 	}
+}
+
+func (s *Supervisor) SetNetworkInfo(networkType string, isMetered bool) {
+	if s == nil {
+		return
+	}
+	nt := networkType
+	if nt == "" {
+		nt = "unknown"
+	}
+	s.networkTypePtr.Store(&nt)
+	s.isMetered.Store(isMetered)
+}
+
+func (s *Supervisor) emitPoolSummary(proxy *ProxyServer, pool *TunnelPool) {
+	if s == nil || s.logger == nil {
+		return
+	}
+	st := proxy.SnapshotWindow(true)
+	ps := pool.PoolSnapshot()
+	var gs GitHubGuardSnapshot
+	if s.guard != nil {
+		gs = s.guard.CachedSnapshot()
+	}
+	netType := "unknown"
+	if ptr := s.networkTypePtr.Load(); ptr != nil && *ptr != "" {
+		netType = *ptr
+	}
+
+	var healthyRTTs []float64
+	for _, w := range ps.Workers {
+		if w.State == TunnelHealthy && w.EWMARTTMS > 0 {
+			healthyRTTs = append(healthyRTTs, w.EWMARTTMS)
+		}
+	}
+	var p95MS, p99MS float64
+	if len(healthyRTTs) > 0 {
+		sort.Float64s(healthyRTTs)
+		_, _, p95MS, p99MS = computeRTTStats(healthyRTTs)
+	}
+
+	fields := map[string]any{
+		"state":                string(s.AtomicState()),
+		"power_state":          string(ps.PowerState),
+		"routing_mode":         ps.RoutingMode,
+		"primary_tunnel":       ps.PrimaryTunnelID,
+		"healthy_workers":      ps.HealthyWorkers,
+		"parked_workers":       ps.ParkedWorkers,
+		"pool_size":            ps.PoolSize,
+		"active_conns":         st.ActiveConns,
+		"peak_conns":           st.PeakConns,
+		"queued_conns":         st.QueuedConns,
+		"bytes_up_window":      st.BytesUpWindow,
+		"bytes_down_window":    st.BytesDownWindow,
+		"total_bytes_up":       s.closedBytesUp.Load() + st.TotalBytesUp,
+		"total_bytes_down":     s.closedBytesDown.Load() + st.TotalBytesDown,
+		"aggregate_p50_ms":     ps.AggregateP50MS,
+		"rtt_p95_ms":           round2(p95MS),
+		"rtt_p99_ms":           round2(p99MS),
+		"underlay_baseline_ms": ps.UnderlayBaselineMS,
+		"network_type":         netType,
+		"is_metered":           s.isMetered.Load(),
+		"primary_switches":     ps.PrimarySwitches,
+		"slow_lane_evictions":  ps.SlowLaneEvictions,
+		"total_failovers":      ps.TotalFailovers,
+		"dial_ok_window":       st.DialOK,
+		"dial_fail_window":     st.DialFail,
+		"waf_5m":               gs.CallsLast5Min,
+		"waf_max_5m":           gs.MaxCallsPer5Min,
+		"waf_1h":               gs.CallsLastHour,
+		"waf_max_1h":           gs.MaxCallsPerHour,
+		"waf_cooldown_ms":      gs.CooldownRemainingMS,
+		"goroutines":           runtime.NumGoroutine(),
+	}
+	for i, w := range ps.Workers {
+		prefix := fmt.Sprintf("t%d_", i+1)
+		fields[prefix+"state"] = string(w.State)
+		fields[prefix+"rtt_ms"] = w.EWMARTTMS
+		fields[prefix+"jitter_ms"] = w.EWMAJitterMS
+		fields[prefix+"err_rate"] = w.StreamErrorRate
+		fields[prefix+"rho"] = w.RelativeRho
+		fields[prefix+"active"] = w.ActiveStreams
+		fields[prefix+"pmtu576"] = w.PMTU576Active
+		fields[prefix+"wan"] = RedactSecrets(w.WANRemote)
+	}
+	s.logger.Log("POOL_SUMMARY", fields)
 }
 
 func (s *Supervisor) Run(parentCtx context.Context) error {
@@ -380,23 +470,7 @@ func (s *Supervisor) Run(parentCtx context.Context) error {
 			reconcileHealth()
 			healthTimer.Reset(nextHealthDelay())
 		case <-summaryTicker.C:
-			if s.logger != nil {
-				st := proxy.SnapshotWindow(true)
-				ps := pool.PoolSnapshot()
-				s.logger.Log("POOL_SUMMARY", map[string]any{
-					"state":                string(s.State()),
-					"power_state":          string(ps.PowerState),
-					"healthy_workers":      ps.HealthyWorkers,
-					"parked_workers":       ps.ParkedWorkers,
-					"pool_size":            ps.PoolSize,
-					"active_conns":         st.ActiveConns,
-					"bytes_up_window":      st.BytesUpWindow,
-					"bytes_down_window":    st.BytesDownWindow,
-					"aggregate_p50_ms":     ps.AggregateP50MS,
-					"underlay_baseline_ms": ps.UnderlayBaselineMS,
-					"goroutines":           runtime.NumGoroutine(),
-				})
-			}
+			s.emitPoolSummary(proxy, pool)
 		}
 	}
 }
@@ -419,6 +493,7 @@ func (s *Supervisor) stopActiveProxy(forceClose bool) {
 
 func (s *Supervisor) executeOrderedShutdown() {
 	s.shutdownOnce.Do(func() {
+		finalState := s.AtomicState()
 		s.setState(StateShutdown)
 		s.stopActiveProxy(true)
 
@@ -427,7 +502,9 @@ func (s *Supervisor) executeOrderedShutdown() {
 		s.activePool = nil
 		s.activePoolPtr.Store(nil)
 		s.poolMu.Unlock()
+		var lastPoolSnap PoolSnapshot
 		if pool != nil {
+			lastPoolSnap = pool.CachedSnapshot()
 			if pool.HasWokenVM() {
 				s.vmWoken.Store(true)
 			}
@@ -450,6 +527,25 @@ func (s *Supervisor) executeOrderedShutdown() {
 		s.shutdownMu.Unlock()
 
 		if s.logger != nil {
+			var gs GitHubGuardSnapshot
+			if s.guard != nil {
+				gs = s.guard.CachedSnapshot()
+			}
+			deduped, archSegs := s.logger.ArchiveStats()
+			s.logger.Log("SESSION_ROLLUP", map[string]any{
+				"duration_sec":             int64(time.Since(s.sessionStart).Seconds()),
+				"total_bytes_up":           s.closedBytesUp.Load(),
+				"total_bytes_down":         s.closedBytesDown.Load(),
+				"total_failovers":          lastPoolSnap.TotalFailovers,
+				"primary_switches":         lastPoolSnap.PrimarySwitches,
+				"slow_lane_evictions":      lastPoolSnap.SlowLaneEvictions,
+				"waf_calls_5m":             gs.CallsLast5Min,
+				"waf_calls_hour":           gs.CallsLastHour,
+				"final_state":              string(finalState),
+				"stop_reason":              reason,
+				"clustered_errors_deduped": deduped,
+				"archive_segments_count":   archSegs,
+			})
 			s.logger.Log("SHUTDOWN_COMPLETE", map[string]any{
 				"reason":                 reason,
 				"stop_codespace_invoked": stopInvoked,

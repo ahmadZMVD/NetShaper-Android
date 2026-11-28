@@ -102,7 +102,10 @@ const (
 	DefaultNetworkDebounceInterval  = 1500 * time.Millisecond
 	DefaultSuspendJumpThreshold     = 14 * time.Second
 	DefaultMaxLogFileBytes          = 2 * 1024 * 1024
-	DefaultLogFileName              = "netshaper_mobile.log"
+	DefaultMaxArchiveTotalBytes     = int64(32 * 1024 * 1024) // 32 MiB cap (strictly in 10..50 MiB)
+	DefaultLogClusterWindow         = 60 * time.Second
+	DefaultLogFlushCadence          = 5 * time.Second
+	DefaultLogFileName              = "netshaper_mobile.jsonl"
 	DefaultMetricsFileName          = "netshaper_mobile_metrics.ndjson"
 	DefaultCodespaceCacheFileName   = "codespace_state_cache.json"
 	DefaultGitHubAPIBaseURL         = "https://api.github.com"
@@ -212,6 +215,8 @@ type Config struct {
 	NetworkDebounceInterval      time.Duration
 	SuspendJumpThreshold         time.Duration
 	MaxLogFileBytes              int64
+	MaxArchiveTotalBytes         int64
+	LogClusterWindow             time.Duration
 	EnableMetricsLog             bool
 	AllowInsecureLocalEndpoints  bool // strictly for offline loopback mock tests
 }
@@ -302,6 +307,8 @@ func DefaultConfig() Config {
 		NetworkDebounceInterval:      DefaultNetworkDebounceInterval,
 		SuspendJumpThreshold:         DefaultSuspendJumpThreshold,
 		MaxLogFileBytes:              DefaultMaxLogFileBytes,
+		MaxArchiveTotalBytes:         DefaultMaxArchiveTotalBytes,
+		LogClusterWindow:             DefaultLogClusterWindow,
 		EnableMetricsLog:             false,
 	}
 }
@@ -438,6 +445,12 @@ func (c Config) Validate() error {
 	}
 	if c.SlowLanePeerAdvantageRatio > 0 && c.SlowLanePeerAdvantageRatio < 1.0 {
 		return fmt.Errorf("slow-lane-peer-advantage-ratio must be >= 1.0, got %.2f", c.SlowLanePeerAdvantageRatio)
+	}
+	if c.MaxArchiveTotalBytes < 0 {
+		return fmt.Errorf("max-archive-total-bytes must be >= 0, got %d", c.MaxArchiveTotalBytes)
+	}
+	if c.LogClusterWindow < 0 {
+		return fmt.Errorf("log-cluster-window must be >= 0, got %s", c.LogClusterWindow)
 	}
 	for _, t := range c.ParsedUnderlayTargets() {
 		if IsGitHubHost(t) {

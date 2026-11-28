@@ -310,6 +310,9 @@ func (c *SessionController) applyDebouncedNetworkChange() {
 
 	c.resolver.FlushCache()
 	sup := c.activeSup.Load()
+	if sup != nil {
+		sup.SetNetworkInfo(nt, metered)
+	}
 
 	if nt == "none" {
 		if !wasApplied || prev != "none" {
@@ -389,14 +392,18 @@ func (c *SessionController) runSession() {
 			metricsPath = filepath.Join(c.cfg.DataDir, DefaultMetricsFileName)
 		}
 	}
-	eventLogger, err := NewEventLogger(logPath, c.cfg.MaxLogFileBytes)
+	eventLogger, err := NewEventLoggerWithArchive(logPath, c.cfg.MaxLogFileBytes, c.cfg.MaxArchiveTotalBytes, c.cfg.LogClusterWindow)
 	if err != nil {
 		// Fall back cleanly to observer-only in-memory logging rather than failing start.
-		eventLogger, _ = NewEventLogger("", c.cfg.MaxLogFileBytes)
+		eventLogger, _ = NewEventLoggerWithArchive("", c.cfg.MaxLogFileBytes, c.cfg.MaxArchiveTotalBytes, c.cfg.LogClusterWindow)
 	}
 	eventLogger.SetObserver(func(rec LogRecord) {
 		sev, line := FormatLogRecord(rec)
-		c.logs.Append(sev, line)
+		ts := time.Now()
+		if rec.UnixMS > 0 {
+			ts = time.UnixMilli(rec.UnixMS)
+		}
+		c.logs.AppendAt(ts, sev, line)
 	})
 
 	var metricsEmitter *MetricsEmitter
@@ -459,6 +466,18 @@ func (c *SessionController) runSession() {
 			}
 		},
 	})
+	c.mu.RLock()
+	initNT, initMetered := c.networkType, c.isMetered
+	c.mu.RUnlock()
+	if initNT == "" || initNT == "unknown" {
+		c.netMu.Lock()
+		if c.netPendingType != "" {
+			initNT = c.netPendingType
+			initMetered = c.netPendingMeter
+		}
+		c.netMu.Unlock()
+	}
+	sup.SetNetworkInfo(initNT, initMetered)
 
 	runCtx, runCancel := context.WithCancel(context.Background())
 	c.runMu.Lock()

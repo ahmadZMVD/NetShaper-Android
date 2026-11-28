@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
@@ -1135,6 +1137,7 @@ func TestMT05_NetworkHandoverFlapStormAndPausedOffline(t *testing.T) {
 	ctrl.StopAndWait(4 * time.Second)
 	assertGoroutinesClean(t, baseG, 10)
 }
+
 
 // =============================================================================
 // MT-06: Adaptive Idle Scaling (ACTIVE -> IDLE_LIGHT -> IDLE_DEEP 2->1) & 0ms Wake-Up
@@ -3568,3 +3571,526 @@ func TestMT32_Stage1PlusStage2CombinedHandoverWithActiveStreams(t *testing.T) {
 	ctrl.StopAndWait(4 * time.Second)
 	assertGoroutinesClean(t, baseG, 10)
 }
+
+// =============================================================================
+// MT-33..MT-38: Phase 6 Stage 3 — Gzip Archive, Clustering, IDLE_DEEP, Ring 2500 & Clock Parity
+// =============================================================================
+
+func TestMT33_Stage3ArchiveGzipRotationAndFIFOCap(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, DefaultLogFileName)
+
+	// Pre-plant orphaned crash artifacts to prove startup recovery deletes only .tmp/.rotating.*
+	staleTmp := filepath.Join(dir, "archive_20260101_000000_000001.jsonl.gz.tmp")
+	staleRot := logPath + ".rotating.99"
+	if err := os.WriteFile(staleTmp, []byte("partial"), 0o600); err != nil {
+		t.Fatalf("MT-33 write stale tmp: %v", err)
+	}
+	if err := os.WriteFile(staleRot, []byte("rotating"), 0o600); err != nil {
+		t.Fatalf("MT-33 write stale rot: %v", err)
+	}
+
+	const maxSeg = int64(2048)
+	const maxCap = int64(3200)
+	l, err := newEventLoggerForTest(logPath, maxSeg, maxCap, true, 60*time.Second, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("MT-33 new logger: %v", err)
+	}
+
+	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
+		_ = l.Close()
+		t.Fatalf("MT-33 startup cleanup did not remove stale tmp: %v", err)
+	}
+	if _, err := os.Stat(staleRot); !os.IsNotExist(err) {
+		_ = l.Close()
+		t.Fatalf("MT-33 startup cleanup did not remove stale rotating file: %v", err)
+	}
+
+	// Emit 220 diverse records (~55-65 KiB raw JSONL -> ~25+ segment rotations -> FIFO pruning down to <= 3200B cap).
+	for i := 0; i < 220; i++ {
+		l.Log("POOL_SUMMARY", map[string]any{
+			"seq_idx":          i,
+			"state":            "RUNNING",
+			"power_state":      "ACTIVE",
+			"routing_mode":     "balanced",
+			"healthy_workers":  2,
+			"pool_size":        2,
+			"active_conns":     (i % 19) + 1,
+			"aggregate_p50_ms": 210.5 + float64(i%37)*0.7,
+			"total_bytes_up":   uint64(i * 4096),
+			"total_bytes_down": uint64(i * 32768),
+			"network_type":     "cellular",
+			"note":             fmt.Sprintf("entropy-%04d-%x", i, sha256.Sum256([]byte(fmt.Sprintf("k-%d", i)))),
+		})
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("MT-33 logger close: %v", err)
+	}
+	if dropped := l.DroppedCount(); dropped != 0 {
+		t.Fatalf("MT-33 unexpected dropped records: %d", dropped)
+	}
+
+	archives := listArchiveFiles(dir)
+	if len(archives) < 2 {
+		t.Fatalf("MT-33 expected >= 2 gzipped archives retained, got %d", len(archives))
+	}
+	if len(archives) >= 12 {
+		t.Fatalf("MT-33 FIFO pruning failed to trim excess segments: still have %d archives", len(archives))
+	}
+
+	var archTotal int64
+	decodedTotal := 0
+	for _, ap := range archives {
+		info, err := os.Stat(ap)
+		if err != nil {
+			t.Fatalf("MT-33 stat archive %s: %v", ap, err)
+		}
+		archTotal += info.Size()
+
+		f, err := os.Open(ap)
+		if err != nil {
+			t.Fatalf("MT-33 open archive %s: %v", ap, err)
+		}
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			_ = f.Close()
+			t.Fatalf("MT-33 gzip reader %s: %v", ap, err)
+		}
+		rawBytes, err := io.ReadAll(gz)
+		_ = gz.Close()
+		_ = f.Close()
+		if err != nil {
+			t.Fatalf("MT-33 decompress %s: %v", ap, err)
+		}
+		for _, ln := range strings.Split(strings.TrimSpace(string(rawBytes)), "\n") {
+			if ln == "" {
+				continue
+			}
+			var rec LogRecord
+			if err := json.Unmarshal([]byte(ln), &rec); err != nil {
+				t.Fatalf("MT-33 invalid JSONL inside %s: %v (%s)", ap, err, ln)
+			}
+			if rec.SchemaVersion != 1 || rec.UnixMS <= 0 || rec.Event == "" {
+				t.Fatalf("MT-33 invalid archived record fields in %s: %+v", ap, rec)
+			}
+			decodedTotal++
+		}
+	}
+
+	if archTotal > maxCap {
+		t.Fatalf("MT-33 archive total %d exceeded maxArchiveBytes %d", archTotal, maxCap)
+	}
+	if decodedTotal == 0 {
+		t.Fatalf("MT-33 expected decoded records across gzipped archives, got 0")
+	}
+	if _, segs := l.ArchiveStats(); segs != len(archives) {
+		t.Fatalf("MT-33 ArchiveStats count=%d != disk count=%d", segs, len(archives))
+	}
+
+	entries, _ := os.ReadDir(dir)
+	for _, ent := range entries {
+		name := ent.Name()
+		if strings.HasSuffix(name, ".tmp") || strings.Contains(name, ".rotating.") {
+			t.Fatalf("MT-33 leftover temporary file after rotation: %s", name)
+		}
+	}
+
+	assertGoroutinesClean(t, baseG, 5)
+}
+
+func TestMT34_Stage3ErrorBurstClusteringAndSecretRedaction(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, DefaultLogFileName)
+
+	l, err := newEventLoggerForTest(logPath, 512*1024, 32*1024*1024, true, 90*time.Millisecond, 30*time.Millisecond)
+	if err != nil {
+		t.Fatalf("MT-34 new logger: %v", err)
+	}
+
+	rawGitHub := "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz1234567890"
+	rawBearer := "superSecretJwtPayloadValue987654"
+	rawTunnel := "dtSecretTunnelTokenXYZ123"
+	rawTrace := "0af123456789abcdef0123456789abcdef"
+
+	for i := 0; i < 48; i++ {
+		l.Log("SOCKS_STREAM_ERR", map[string]any{
+			"tunnel_id": "tunnel-1",
+			"error": fmt.Sprintf(
+				"dial failure 10.0.0.1:%d token=%s Authorization: Bearer %s X-Tunnel-Authorization: %s &traceId=%s",
+				20000+i, rawGitHub, rawBearer, rawTunnel, rawTrace,
+			),
+		})
+	}
+	for i := 0; i < 10; i++ {
+		l.Log("WORKER_BOOT_FAIL", map[string]any{
+			"tunnel_id": "tunnel-2",
+			"error":     fmt.Sprintf("ssh handshake timeout 192.168.1.50:%d &traceId=%s", 30000+i, rawTrace),
+		})
+	}
+
+	// Wait past clusterWindow (90ms) so clusters auto-flush before Close() as well.
+	time.Sleep(180 * time.Millisecond)
+	if err := l.Close(); err != nil {
+		t.Fatalf("MT-34 close: %v", err)
+	}
+
+	rawDisk, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("MT-34 read log: %v", err)
+	}
+	diskText := string(rawDisk)
+	for _, secret := range []string{rawGitHub, rawBearer, rawTunnel} {
+		if strings.Contains(diskText, secret) {
+			t.Fatalf("MT-34 leaked secret %q into archived JSONL: %s", secret, diskText)
+		}
+	}
+
+	lines := strings.Split(strings.TrimSpace(diskText), "\n")
+	if len(lines) > 6 {
+		t.Fatalf("MT-34 clustering failed to coalesce 58 burst errors: got %d JSONL lines", len(lines))
+	}
+
+	foundStreamCluster := false
+	for _, ln := range lines {
+		var rec LogRecord
+		if err := json.Unmarshal([]byte(ln), &rec); err != nil {
+			t.Fatalf("MT-34 invalid JSONL: %v", err)
+		}
+		if rec.Event == "SOCKS_STREAM_ERR" && rec.RepeatCount > 0 {
+			foundStreamCluster = true
+			if rec.RepeatCount != 47 {
+				t.Fatalf("MT-34 expected RepeatCount=47 coalesced duplicates, got %d", rec.RepeatCount)
+			}
+			if rec.ClusterSig == "" || rec.FirstUnixMS <= 0 || rec.LastUnixMS < rec.FirstUnixMS {
+				t.Fatalf("MT-34 incomplete cluster metadata: %+v", rec)
+			}
+			for _, tok := range []string{rawGitHub, rawBearer, rawTunnel, rawTrace} {
+				if strings.Contains(rec.ClusterSig, tok) {
+					t.Fatalf("MT-34 secret/trace leaked into cluster_sig: %s", rec.ClusterSig)
+				}
+			}
+			_, formatted := FormatLogRecord(rec)
+			if !strings.Contains(formatted, "(x47 clustered)") {
+				t.Fatalf("MT-34 FormatLogRecord missing clustered suffix: %s", formatted)
+			}
+		}
+	}
+	if !foundStreamCluster {
+		t.Fatalf("MT-34 missing clustered SOCKS_STREAM_ERR record; disk=%s", diskText)
+	}
+
+	deduped, _ := l.ArchiveStats()
+	if deduped < 56 {
+		t.Fatalf("MT-34 expected >= 56 deduped burst errors, got %d", deduped)
+	}
+	assertGoroutinesClean(t, baseG, 5)
+}
+
+func TestMT35_Stage3EnrichedPoolSummaryAndSessionRollup(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	tr := &mockTransport{}
+	dataDir := t.TempDir()
+
+	cfg := DefaultConfig()
+	cfg.DataDir = dataDir
+	cfg.CodespaceName = "mt35-rollup"
+	cfg.LocalPort = 0
+	cfg.PoolSize = 2
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.StopOnExit = false
+	cfg.NetworkDebounceInterval = 40 * time.Millisecond
+	cfg.BackoffMin = 20 * time.Millisecond
+	cfg.BackoffMax = 40 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	ctrl := NewSessionController(cfg, ControllerCallbacks{}, ControllerOverrides{
+		TransportFactory: func(_ Config, _ *CredentialManager, _ *AntiPoisonResolver, _ *HeartbeatCoordinator, _ *EventLogger) WorkerTransport {
+			return tr
+		},
+		PoolHooks: PoolHooks{
+			UnderlayProbeFunc: func(_ context.Context, _ []string, _ time.Duration) (time.Duration, string, error) {
+				return 112 * time.Millisecond, "1.1.1.1:443", nil
+			},
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 195 * time.Millisecond, nil
+			},
+		},
+		SnapshotInterval: 40 * time.Millisecond,
+	})
+	ctrl.NotifyNetworkChange("wifi", false)
+	ctrl.Start()
+
+	waitUntilCond(t, 4*time.Second, "MT-35 2/2 healthy", func() bool {
+		s := ctrl.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+
+	if err := performSOCKS5DomainEcho(ctrl.Snapshot().LocalAddr, "api.example.com", 443, []byte("mt35-summary-traffic"), 2*time.Second); err != nil {
+		ctrl.StopAndWait(4 * time.Second)
+		t.Fatalf("MT-35 SOCKS5 echo failed: %v", err)
+	}
+
+	sup := ctrl.activeSup.Load()
+	if sup == nil {
+		ctrl.StopAndWait(4 * time.Second)
+		t.Fatalf("MT-35 activeSup nil")
+	}
+	sup.emitPoolSummary(sup.activeProxyPtr.Load(), sup.activePoolPtr.Load())
+
+	ctrl.StopAndWait(4 * time.Second)
+
+	logPath := filepath.Join(dataDir, DefaultLogFileName)
+	rawBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("MT-35 read jsonl: %v", err)
+	}
+
+	var gotPoolSummary, gotSessionRollup bool
+	for _, ln := range strings.Split(strings.TrimSpace(string(rawBytes)), "\n") {
+		if ln == "" {
+			continue
+		}
+		var rec LogRecord
+		if err := json.Unmarshal([]byte(ln), &rec); err != nil {
+			t.Fatalf("MT-35 invalid jsonl: %v", err)
+		}
+		switch rec.Event {
+		case "POOL_SUMMARY":
+			gotPoolSummary = true
+			for _, reqKey := range []string{
+				"state", "power_state", "routing_mode", "healthy_workers", "pool_size",
+				"aggregate_p50_ms", "rtt_p95_ms", "rtt_p99_ms", "network_type", "is_metered",
+				"total_bytes_up", "total_bytes_down", "waf_5m", "waf_max_5m",
+				"t1_state", "t1_rtt_ms", "t1_jitter_ms", "t1_err_rate", "t1_rho", "t1_pmtu576",
+				"t2_state", "t2_rtt_ms",
+			} {
+				if _, ok := rec.Fields[reqKey]; !ok {
+					t.Fatalf("MT-35 POOL_SUMMARY missing enriched field %q: %+v", reqKey, rec.Fields)
+				}
+			}
+			if gotNet, _ := rec.Fields["network_type"].(string); gotNet != "wifi" {
+				t.Fatalf("MT-35 POOL_SUMMARY network_type=%q want wifi", gotNet)
+			}
+			if _, txt := FormatLogRecord(rec); !strings.Contains(txt, "[Summary]") {
+				t.Fatalf("MT-35 FormatLogRecord(POOL_SUMMARY) unexpected format: %s", txt)
+			}
+		case "SESSION_ROLLUP":
+			gotSessionRollup = true
+			for _, reqKey := range []string{
+				"duration_sec", "total_bytes_up", "total_bytes_down",
+				"total_failovers", "primary_switches", "slow_lane_evictions",
+				"clustered_errors_deduped", "archive_segments_count", "stop_reason",
+			} {
+				if _, ok := rec.Fields[reqKey]; !ok {
+					t.Fatalf("MT-35 SESSION_ROLLUP missing field %q: %+v", reqKey, rec.Fields)
+				}
+			}
+			if _, txt := FormatLogRecord(rec); !strings.Contains(txt, "[Session]") {
+				t.Fatalf("MT-35 FormatLogRecord(SESSION_ROLLUP) unexpected format: %s", txt)
+			}
+		}
+	}
+
+	if !gotPoolSummary {
+		t.Fatalf("MT-35 no POOL_SUMMARY recorded in %s", logPath)
+	}
+	if !gotSessionRollup {
+		t.Fatalf("MT-35 no SESSION_ROLLUP recorded in %s", logPath)
+	}
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+func TestMT36_Stage3DirtyBufferIdleDeepZeroWakeups(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	logPath := filepath.Join(t.TempDir(), DefaultLogFileName)
+
+	// Short 35ms flush cadence so idle wakeup multiplication is exposed rapidly.
+	l, err := newEventLoggerForTest(logPath, 512*1024, 32*1024*1024, true, 60*time.Second, 35*time.Millisecond)
+	if err != nil {
+		t.Fatalf("MT-36 new logger: %v", err)
+	}
+
+	// Clean at boot: zero logs -> timer must remain disarmed for 160ms (> 4x cadence).
+	time.Sleep(160 * time.Millisecond)
+	if wakes := l.timerWakeCount.Load(); wakes != 0 {
+		_ = l.Close()
+		t.Fatalf("MT-36 idle logger woke up %d times before any dirty write (want 0)", wakes)
+	}
+	if flushes := l.flushCount.Load(); flushes != 0 {
+		_ = l.Close()
+		t.Fatalf("MT-36 idle logger flushed %d times cleanly (want 0)", flushes)
+	}
+
+	// Write 1 dirty event: timer arms once, flushes cleanly within ~35ms.
+	l.Log("BOOT_READY", map[string]any{"healthy_workers": 2, "pool_size": 2})
+	waitUntilCond(t, 500*time.Millisecond, "MT-36 single dirty flush executes", func() bool {
+		return l.flushCount.Load() == 1
+	})
+
+	raw, err := os.ReadFile(logPath)
+	if err != nil || !strings.Contains(string(raw), "BOOT_READY") {
+		_ = l.Close()
+		t.Fatalf("MT-36 flushed log missing BOOT_READY: err=%v raw=%q", err, string(raw))
+	}
+
+	wakesBeforeIdle := l.timerWakeCount.Load()
+	flushesBeforeIdle := l.flushCount.Load()
+
+	// Sustained silence (IDLE_DEEP): wait 260ms (~7.4x cadence) and prove ZERO wakeups/flushes occur.
+	time.Sleep(260 * time.Millisecond)
+	if gotW := l.timerWakeCount.Load(); gotW != wakesBeforeIdle {
+		_ = l.Close()
+		t.Fatalf("MT-36 timer woke %d extra times during clean IDLE_DEEP silence (want 0)", gotW-wakesBeforeIdle)
+	}
+	if gotF := l.flushCount.Load(); gotF != flushesBeforeIdle {
+		_ = l.Close()
+		t.Fatalf("MT-36 disk flushed %d extra times during clean IDLE_DEEP silence (want 0)", gotF-flushesBeforeIdle)
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("MT-36 close: %v", err)
+	}
+	assertGoroutinesClean(t, baseG, 5)
+}
+
+func TestMT37_Stage3RingBuffer2500AndClearPreservesArchive(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, DefaultLogFileName)
+
+	l, err := newEventLoggerForTest(logPath, 2048, 256*1024, true, 60*time.Second, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("MT-37 logger: %v", err)
+	}
+
+	rb := NewTerminalRingBuffer()
+	l.SetObserver(func(rec LogRecord) {
+		sev, line := FormatLogRecord(rec)
+		rb.AppendAt(time.UnixMilli(rec.UnixMS), sev, line)
+	})
+
+	// Fill archive + exceed 2500-line ring buffer (3100 entries with multi-byte UTF-8 payloads > 384 bytes).
+	longSuffix := strings.Repeat("آ", 180) + " 🔒 utf8-boundary-test-tail"
+	for i := 0; i < 3100; i++ {
+		if i < 60 {
+			l.Log("POOL_SUMMARY", map[string]any{
+				"state":           "RUNNING",
+				"power_state":     "ACTIVE",
+				"routing_mode":    "balanced",
+				"healthy_workers": 2,
+				"pool_size":       2,
+				"padding":         fmt.Sprintf("%04d-%s", i, longSuffix),
+			})
+		} else {
+			rb.AppendAt(time.UnixMilli(1780000000000+int64(i)*1000), LogInfo, fmt.Sprintf("[Line-%04d] %s", i, longSuffix))
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("MT-37 close: %v", err)
+	}
+
+	if rb.Len() != TerminalRingCapacity || TerminalRingCapacity != 2500 {
+		t.Fatalf("MT-37 ring capacity=%d len=%d (want 2500)", TerminalRingCapacity, rb.Len())
+	}
+
+	lines := rb.Since(0)
+	if len(lines) != 2500 {
+		t.Fatalf("MT-37 Since(0) returned %d lines, want 2500", len(lines))
+	}
+	if lines[0].Seq != lines[len(lines)-1].Seq-2499 {
+		t.Fatalf("MT-37 non-contiguous ring eviction sequences: first=%d last=%d", lines[0].Seq, lines[len(lines)-1].Seq)
+	}
+	for idx, ln := range lines {
+		if ln.UnixMS <= 0 {
+			t.Fatalf("MT-37 line %d missing UnixMS: %+v", idx, ln)
+		}
+		if len(ln.Text) > TerminalMaxLineBytes {
+			t.Fatalf("MT-37 line %d exceeded max bytes %d: len=%d", idx, TerminalMaxLineBytes, len(ln.Text))
+		}
+		if !utf8.ValidString(ln.Text) {
+			t.Fatalf("MT-37 line %d broken UTF-8 truncation: %q", idx, ln.Text)
+		}
+	}
+
+	archivesBefore := listArchiveFiles(dir)
+	if len(archivesBefore) == 0 {
+		t.Fatalf("MT-37 expected rotated gzip archive files before Clear()")
+	}
+	beforeSizes := make(map[string]int64, len(archivesBefore)+1)
+	if info, err := os.Stat(logPath); err == nil {
+		beforeSizes[logPath] = info.Size()
+	}
+	for _, ap := range archivesBefore {
+		info, err := os.Stat(ap)
+		if err != nil {
+			t.Fatalf("MT-37 stat before clear %s: %v", ap, err)
+		}
+		beforeSizes[ap] = info.Size()
+	}
+
+	// Clearing the UI ring buffer MUST preserve all disk archives byte-for-byte.
+	rb.Clear()
+	if rb.Len() != 0 || len(rb.Since(0)) != 0 {
+		t.Fatalf("MT-37 ring buffer not empty after Clear()")
+	}
+	for path, wantSize := range beforeSizes {
+		info, err := os.Stat(path)
+		if err != nil || info.Size() != wantSize {
+			t.Fatalf("MT-37 Clear() mutated archive %s (want=%d gotErr=%v)", path, wantSize, err)
+		}
+	}
+
+	assertGoroutinesClean(t, baseG, 5)
+}
+
+func TestMT38_Stage3UnixMSClockParityAndUTF8Truncation(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	rb := NewTerminalRingBuffer()
+
+	utcInstant := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	irstZone := time.FixedZone("IRST", 3*3600+1800)
+	irstInstant := utcInstant.In(irstZone)
+
+	lUTC := rb.AppendAt(utcInstant, LogInfo, "[Ready] instant-utc")
+	lIRST := rb.AppendAt(irstInstant, LogInfo, "[Ready] instant-irst")
+
+	if lUTC.UnixMS != lIRST.UnixMS || lUTC.UnixMS != utcInstant.UnixMilli() {
+		t.Fatalf("MT-38 UnixMS mismatch across timezones: utc=%d irst=%d want=%d",
+			lUTC.UnixMS, lIRST.UnixMS, utcInstant.UnixMilli())
+	}
+
+	// Simulate Android formatting from unix_ms in Asia/Tehran (+03:30) — both render identically!
+	gotFromUTC := time.UnixMilli(lUTC.UnixMS).In(irstZone).Format("15:04:05")
+	gotFromIRST := time.UnixMilli(lIRST.UnixMS).In(irstZone).Format("15:04:05")
+	if gotFromUTC != "15:30:00" || gotFromIRST != "15:30:00" {
+		t.Fatalf("MT-38 timezone unification mismatch: fromUTC=%s fromIRST=%s want=15:30:00", gotFromUTC, gotFromIRST)
+	}
+
+	rawJSON, err := json.Marshal(rb.Since(0))
+	if err != nil {
+		t.Fatalf("MT-38 json marshal TerminalLine: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(rawJSON, &decoded); err != nil || len(decoded) != 2 {
+		t.Fatalf("MT-38 json decode TerminalLine failed: %v (%s)", err, string(rawJSON))
+	}
+	for _, key := range []string{"seq", "unix_ms", "ts", "level", "text"} {
+		if _, ok := decoded[0][key]; !ok {
+			t.Fatalf("MT-38 TerminalLine JSON missing field %q: %s", key, string(rawJSON))
+		}
+	}
+
+	// Verify rune-boundary-safe UTF-8 truncation with 4-byte emoji straddling maxBytes=10.
+	sample := "ab😀cd😀ef"
+	trunc := truncateUTF8(sample, 5)
+	if !utf8.ValidString(trunc) || len(trunc) > 5 {
+		t.Fatalf("MT-38 invalid UTF-8 truncation result: %q (len=%d)", trunc, len(trunc))
+	}
+
+	assertGoroutinesClean(t, baseG, 5)
+}
+

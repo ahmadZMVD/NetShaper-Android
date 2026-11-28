@@ -2,12 +2,15 @@ package engine
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,11 +19,15 @@ import (
 )
 
 const (
-	loggerChannelCap     = 512
-	loggerBufSize        = 8192
-	loggerFlushCadence   = 2 * time.Second
-	TerminalRingCapacity = 500
-	TerminalMaxLineBytes = 256
+	loggerChannelCap      = 512
+	loggerBufSize         = 8192
+	loggerFlushCadence    = DefaultLogFlushCadence
+	TerminalRingCapacity  = 2500
+	TerminalMaxLineBytes  = 384
+	logSchemaVersion      = 1
+	maxActiveClusters     = 64
+	maxClusterRepeatCount = 100
+	uiImmediateBurstLimit = 3
 )
 
 // LogSeverity classifies terminal ring lines.
@@ -47,12 +54,21 @@ func (s LogSeverity) String() string {
 }
 
 var (
-	reGitHubToken  = regexp.MustCompile(`\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{8,}\b`)
-	reGitHubPAT    = regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{12,}\b`)
-	reBearerAuth   = regexp.MustCompile(`(?i)\b(Bearer|token|tunnel)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	reJWTToken     = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	reJSONSecField = regexp.MustCompile(`(?i)("(?:access_token|github_token|connect_access_token|manage_ports_access_token|connectAccessToken|managePortsAccessToken|authorization)"\s*:\s*")([^"]+)(")`)
-	reURLSecParam  = regexp.MustCompile(`(?i)([?&](?:access_token|token|connect_access_token|manage_ports_access_token|connectAccessToken|managePortsAccessToken)=)([^&\s"']+)`)
+	reGitHubToken    = regexp.MustCompile(`\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{8,}\b`)
+	reGitHubPAT      = regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{12,}\b`)
+	reHeaderSecField = regexp.MustCompile(`(?i)\b(X-Tunnel-Authorization|Authorization)\s*:\s*(?:(?:Bearer|tunnel)\s+)?[^\s"',;]+`)
+	reBearerAuth     = regexp.MustCompile(`(?i)\b(Bearer|token|tunnel)\s+[A-Za-z0-9._~+/=-]{8,}`)
+	reJWTToken       = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{3,}\.[A-Za-z0-9_-]{3,}\b`)
+	reJSONSecField   = regexp.MustCompile(`(?i)("(?:access_token|github_token|connect_access_token|manage_ports_access_token|connectAccessToken|managePortsAccessToken|authorization)"\s*:\s*")([^"]+)(")`)
+	reURLSecParam    = regexp.MustCompile(`(?i)([?&](?:access_token|token|connect_access_token|manage_ports_access_token|connectAccessToken|managePortsAccessToken)=)([^&\s"']+)`)
+
+	// Volatile token scrubbers for deterministic error-burst clustering (applied strictly AFTER RedactSecrets).
+	reClusterTraceField = regexp.MustCompile(`(?i)"traceId"\s*:\s*"[^"]*"`)
+	reClusterTraceParam = regexp.MustCompile(`(?i)([?&]traceId=)[^&\s"']+`)
+	reClusterTraceHex   = regexp.MustCompile(`\b00-[0-9a-fA-F]{8,}[.\w-]*`)
+	reClusterPort       = regexp.MustCompile(`:\d{4,5}\b`)
+	reClusterDur        = regexp.MustCompile(`\b\d+(?:\.\d+)?\s*(?:ms|s)\b`)
+	reClusterNum        = regexp.MustCompile(`\b\d{4,}\b`)
 )
 
 // RedactSecrets strips GitHub OAuth tokens, PATs, Bearer/tunnel headers, URL query secrets, and Dev Tunnels JWTs.
@@ -62,11 +78,29 @@ func RedactSecrets(s string) string {
 	}
 	s = reJSONSecField.ReplaceAllString(s, `${1}[REDACTED]${3}`)
 	s = reURLSecParam.ReplaceAllString(s, `${1}[REDACTED]`)
+	s = reHeaderSecField.ReplaceAllString(s, `${1}: [REDACTED]`)
 	s = reGitHubPAT.ReplaceAllString(s, "[REDACTED_GH_PAT]")
 	s = reGitHubToken.ReplaceAllString(s, "[REDACTED_GH_TOKEN]")
 	s = reJWTToken.ReplaceAllString(s, "[REDACTED_JWT]")
 	s = reBearerAuth.ReplaceAllString(s, `$1 [REDACTED]`)
 	return s
+}
+
+func redactValue(v any) any {
+	switch tv := v.(type) {
+	case string:
+		return RedactSecrets(tv)
+	case []string:
+		cp := make([]string, len(tv))
+		for i, item := range tv {
+			cp[i] = RedactSecrets(item)
+		}
+		return cp
+	case map[string]any:
+		return redactFields(tv)
+	default:
+		return v
+	}
 }
 
 func redactFields(fields map[string]any) map[string]any {
@@ -76,53 +110,184 @@ func redactFields(fields map[string]any) map[string]any {
 	out := make(map[string]any, len(fields))
 	for k, v := range fields {
 		lk := strings.ToLower(k)
-		if strings.Contains(lk, "token") || strings.Contains(lk, "secret") || strings.Contains(lk, "authorization") {
+		if strings.Contains(lk, "token") ||
+			strings.Contains(lk, "secret") ||
+			strings.Contains(lk, "authorization") ||
+			strings.Contains(lk, "password") ||
+			strings.Contains(lk, "credential") {
 			out[k] = "[REDACTED]"
 			continue
 		}
-		if sv, ok := v.(string); ok {
-			out[k] = RedactSecrets(sv)
-		} else {
-			out[k] = v
-		}
+		out[k] = redactValue(v)
 	}
 	return out
 }
 
-// LogRecord represents a single append-only JSONL telemetry record.
+func normalizeClusterSignature(event, tunnelID, errText string) string {
+	s := RedactSecrets(strings.TrimSpace(errText))
+	s = reClusterTraceField.ReplaceAllString(s, `"traceId":"<TRACE>"`)
+	s = reClusterTraceParam.ReplaceAllString(s, `${1}<TRACE>`)
+	s = reClusterTraceHex.ReplaceAllString(s, "<TRACE>")
+	s = reClusterPort.ReplaceAllString(s, ":<PORT>")
+	s = reClusterDur.ReplaceAllString(s, "<DUR>")
+	s = reClusterNum.ReplaceAllString(s, "<N>")
+	s = RedactSecrets(s)
+	if len(s) > 128 {
+		s = s[:128]
+	}
+	return event + "|" + RedactSecrets(strings.TrimSpace(tunnelID)) + "|" + s
+}
+
+func isClusterableEvent(event string) bool {
+	switch event {
+	case "WORKER_BOOT_FAIL",
+		"WORKER_PROBE_FAIL",
+		"SOCKS_STREAM_ERR",
+		"GITHUB_API_THROTTLED",
+		"WORKER_SLOW_LANE_EVICT_DEFERRED",
+		"WORKER_SLOW_LANE_SOFT_DRAIN",
+		"DNS_POISON_DETECTED":
+		return true
+	default:
+		return false
+	}
+}
+
+func fieldString(fields map[string]any, key string) string {
+	if fields == nil {
+		return ""
+	}
+	if v, ok := fields[key]; ok && v != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	return ""
+}
+
+func extractClusterErrText(rec LogRecord) string {
+	if e := fieldString(rec.Fields, "error"); e != "" {
+		return e
+	}
+	if br := fieldString(rec.Fields, "block_reason"); br != "" {
+		if r := fieldString(rec.Fields, "reason"); r != "" {
+			return br + ":" + r
+		}
+		return br
+	}
+	if dr := fieldString(rec.Fields, "defer_reason"); dr != "" {
+		return dr
+	}
+	if d := fieldString(rec.Fields, "detail"); d != "" {
+		return d
+	}
+	if r := fieldString(rec.Fields, "reason"); r != "" {
+		return r
+	}
+	return rec.Event
+}
+
+// LogRecord represents a single append-only JSONL telemetry or clustered-burst record.
 type LogRecord struct {
-	Timestamp string         `json:"ts"`
-	SessionID string         `json:"session_id"`
-	Event     string         `json:"event"`
-	Fields    map[string]any `json:"fields,omitempty"`
+	SchemaVersion int            `json:"v"`
+	UnixMS        int64          `json:"unix_ms"`
+	Timestamp     string         `json:"ts"`
+	SessionID     string         `json:"session_id"`
+	Event         string         `json:"event"`
+	Severity      string         `json:"severity"`
+	ClusterSig    string         `json:"cluster_sig,omitempty"`
+	RepeatCount   int            `json:"repeat_count,omitempty"`
+	FirstUnixMS   int64          `json:"first_unix_ms,omitempty"`
+	LastUnixMS    int64          `json:"last_unix_ms,omitempty"`
+	Fields        map[string]any `json:"fields,omitempty"`
 }
 
-// EventLogger provides panic-proof, non-blocking, rotating JSONL telemetry safe for mobile flash storage.
+type pendingCluster struct {
+	sig          string
+	event        string
+	severity     string
+	sessionID    string
+	tunnelID     string
+	firstAt      time.Time
+	lastAt       time.Time
+	firstUnixMS  int64
+	lastUnixMS   int64
+	count        int
+	uiForwarded  int
+	sampleFields map[string]any
+}
+
+// EventLogger provides panic-proof, non-blocking, zero-idle-wakeup, clustered & gzip-archived JSONL telemetry.
 type EventLogger struct {
-	sessionID string
-	path      string
-	maxBytes  int64
-	file      *os.File
-	written   int64
-	ch        chan LogRecord
-	quitCh    chan struct{}
-	done      chan struct{}
-	closed    atomic.Bool
-	dropped   atomic.Uint64
-	observer  atomic.Pointer[func(LogRecord)]
-	closeOnce sync.Once
+	sessionID       string
+	path            string
+	maxBytes        int64
+	maxArchiveBytes int64
+	archiveEnabled  bool
+	clusterWindow   time.Duration
+	flushCadence    time.Duration
+	file            *os.File
+	written         int64
+	archiveSeq      uint64
+	ch              chan LogRecord
+	quitCh          chan struct{}
+	done            chan struct{}
+	closed          atomic.Bool
+	dropped         atomic.Uint64
+	dedupedCount    atomic.Uint64
+	archiveCount    atomic.Int64
+	flushCount      atomic.Uint64
+	timerWakeCount  atomic.Uint64
+	observer        atomic.Pointer[func(LogRecord)]
+	closeOnce       sync.Once
 }
 
-// NewEventLogger opens path (or runs in-memory-observer-only mode if path == "") with a rotating byte cap.
+// NewEventLogger opens path (or runs in-memory-observer-only mode if path == "") with legacy .1 single-backup rotation.
 func NewEventLogger(path string, maxBytes int64) (*EventLogger, error) {
+	return newEventLoggerInternal(path, maxBytes, 0, false, DefaultLogClusterWindow, loggerFlushCadence)
+}
+
+// NewEventLoggerWithArchive opens path with gzip-compressed segment rotation, error-burst clustering, and FIFO pruning.
+func NewEventLoggerWithArchive(path string, maxSegmentBytes, maxArchiveBytes int64, clusterWindow time.Duration) (*EventLogger, error) {
+	if maxArchiveBytes <= 0 {
+		maxArchiveBytes = DefaultMaxArchiveTotalBytes
+	}
+	if clusterWindow <= 0 {
+		clusterWindow = DefaultLogClusterWindow
+	}
+	return newEventLoggerInternal(path, maxSegmentBytes, maxArchiveBytes, true, clusterWindow, loggerFlushCadence)
+}
+
+func newEventLoggerForTest(path string, maxSegmentBytes, maxArchiveBytes int64, archiveEnabled bool, clusterWindow, flushCadence time.Duration) (*EventLogger, error) {
+	return newEventLoggerInternal(path, maxSegmentBytes, maxArchiveBytes, archiveEnabled, clusterWindow, flushCadence)
+}
+
+func newEventLoggerInternal(
+	path string,
+	maxBytes int64,
+	maxArchiveBytes int64,
+	archiveEnabled bool,
+	clusterWindow time.Duration,
+	flushCadence time.Duration,
+) (*EventLogger, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxLogFileBytes
 	}
+	if clusterWindow <= 0 {
+		clusterWindow = DefaultLogClusterWindow
+	}
+	if flushCadence <= 0 {
+		flushCadence = loggerFlushCadence
+	}
 	var f *os.File
 	var size int64
+	var initArchives int64
 	if strings.TrimSpace(path) != "" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("mkdir log dir: %w", err)
+		}
+		if archiveEnabled {
+			cleanupStaleArchiveArtifacts(dir)
+			initArchives = int64(len(listArchiveFiles(dir)))
 		}
 		var err error
 		f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -134,17 +299,57 @@ func NewEventLogger(path string, maxBytes int64) (*EventLogger, error) {
 		}
 	}
 	l := &EventLogger{
-		sessionID: fmt.Sprintf("mob%d-%d", os.Getpid(), time.Now().UTC().UnixNano()),
-		path:      path,
-		maxBytes:  maxBytes,
-		file:      f,
-		written:   size,
-		ch:        make(chan LogRecord, loggerChannelCap),
-		quitCh:    make(chan struct{}),
-		done:      make(chan struct{}),
+		sessionID:       fmt.Sprintf("mob%d-%d", os.Getpid(), time.Now().UTC().UnixNano()),
+		path:            path,
+		maxBytes:        maxBytes,
+		maxArchiveBytes: maxArchiveBytes,
+		archiveEnabled:  archiveEnabled,
+		clusterWindow:   clusterWindow,
+		flushCadence:    flushCadence,
+		file:            f,
+		written:         size,
+		ch:              make(chan LogRecord, loggerChannelCap),
+		quitCh:          make(chan struct{}),
+		done:            make(chan struct{}),
 	}
+	l.archiveCount.Store(initArchives)
 	safeGo(nil, "event_logger_writer", l.writerLoop)
 	return l, nil
+}
+
+func cleanupStaleArchiveArtifacts(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if strings.HasSuffix(name, ".jsonl.gz.tmp") || strings.Contains(name, ".rotating.") {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+}
+
+func listArchiveFiles(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if strings.HasPrefix(name, "archive_") && strings.HasSuffix(name, ".jsonl.gz") {
+			out = append(out, filepath.Join(dir, name))
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (l *EventLogger) SessionID() string {
@@ -159,6 +364,14 @@ func (l *EventLogger) DroppedCount() uint64 {
 		return 0
 	}
 	return l.dropped.Load()
+}
+
+// ArchiveStats returns (clustered_errors_deduped, archive_segments_count) wait-free.
+func (l *EventLogger) ArchiveStats() (uint64, int) {
+	if l == nil {
+		return 0, 0
+	}
+	return l.dedupedCount.Load(), int(l.archiveCount.Load())
 }
 
 func (l *EventLogger) SetObserver(fn func(LogRecord)) {
@@ -176,12 +389,19 @@ func (l *EventLogger) Log(event string, fields map[string]any) {
 	if l == nil || l.closed.Load() {
 		return
 	}
+	now := time.Now().UTC()
+	cleanFields := redactFields(fields)
 	rec := LogRecord{
-		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-		SessionID: l.sessionID,
-		Event:     event,
-		Fields:    redactFields(fields),
+		SchemaVersion: logSchemaVersion,
+		UnixMS:        now.UnixMilli(),
+		Timestamp:     now.Format(time.RFC3339Nano),
+		SessionID:     l.sessionID,
+		Event:         event,
+		Fields:        cleanFields,
 	}
+	sev, _ := FormatLogRecord(rec)
+	rec.Severity = sev.String()
+
 	select {
 	case <-l.quitCh:
 		return
@@ -196,26 +416,159 @@ func (l *EventLogger) Log(event string, fields map[string]any) {
 	}
 }
 
+func (l *EventLogger) compressSegmentAtomic(srcPath string, now time.Time) {
+	dir := filepath.Dir(srcPath)
+	tsUTC := now.UTC().Format("20060102_150405")
+	var dstPath string
+	for {
+		l.archiveSeq++
+		cand := filepath.Join(dir, fmt.Sprintf("archive_%s_%06d.jsonl.gz", tsUTC, l.archiveSeq))
+		if _, err := os.Stat(cand); os.IsNotExist(err) {
+			dstPath = cand
+			break
+		}
+	}
+	tmpPath := dstPath + ".tmp"
+	stagingPath := fmt.Sprintf("%s.rotating.%d", srcPath, l.archiveSeq)
+
+	// Rename active segment to staging so concurrent live readers on POSIX never block compression.
+	// On Windows where a concurrent reader may briefly hold srcPath open, retry rename briefly then fall back to copy+truncate.
+	renamed := false
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := os.Rename(srcPath, stagingPath); err == nil {
+			renamed = true
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	copySrc := srcPath
+	if renamed {
+		copySrc = stagingPath
+	}
+
+	var srcFile *os.File
+	var openErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		srcFile, openErr = os.Open(copySrc)
+		if openErr == nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if openErr != nil {
+		if renamed {
+			_ = os.Remove(stagingPath)
+		}
+		return
+	}
+
+	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		_ = srcFile.Close()
+		if renamed {
+			_ = os.Remove(stagingPath)
+		}
+		return
+	}
+	gw, gwErr := gzip.NewWriterLevel(tmpFile, gzip.DefaultCompression)
+	if gwErr != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		_ = srcFile.Close()
+		if renamed {
+			_ = os.Remove(stagingPath)
+		}
+		return
+	}
+	var copyBuf [4096]byte
+	_, copyErr := io.CopyBuffer(gw, srcFile, copyBuf[:])
+	closeGWErr := gw.Close()
+	syncErr := tmpFile.Sync()
+	closeTmpErr := tmpFile.Close()
+	_ = srcFile.Close()
+
+	if copyErr != nil || closeGWErr != nil || syncErr != nil || closeTmpErr != nil {
+		_ = os.Remove(tmpPath)
+		if renamed {
+			_ = os.Remove(stagingPath)
+		}
+		return
+	}
+
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		_ = os.Remove(tmpPath)
+	}
+	if renamed {
+		_ = os.Remove(stagingPath)
+	} else {
+		_ = os.Truncate(srcPath, 0)
+	}
+}
+
+func (l *EventLogger) pruneArchivesLocked() {
+	if !l.archiveEnabled || l.path == "" {
+		return
+	}
+	archives := listArchiveFiles(filepath.Dir(l.path))
+	if l.maxArchiveBytes > 0 {
+		type archEntry struct {
+			path string
+			size int64
+		}
+		items := make([]archEntry, 0, len(archives))
+		var totalArchBytes int64
+		for _, p := range archives {
+			if info, err := os.Stat(p); err == nil {
+				items = append(items, archEntry{path: p, size: info.Size()})
+				totalArchBytes += info.Size()
+			}
+		}
+		for len(items) > 1 && totalArchBytes+l.written > l.maxArchiveBytes {
+			oldest := items[0]
+			if err := os.Remove(oldest.path); err == nil {
+				totalArchBytes -= oldest.size
+				items = items[1:]
+			} else {
+				break
+			}
+		}
+		l.archiveCount.Store(int64(len(items)))
+		return
+	}
+	l.archiveCount.Store(int64(len(archives)))
+}
+
 func (l *EventLogger) rotateLocked(bw **bufio.Writer) {
 	if l.file == nil || l.path == "" || l.maxBytes <= 0 || l.written < l.maxBytes {
 		return
 	}
 	if *bw != nil {
 		_ = (*bw).Flush()
+		l.flushCount.Add(1)
 	}
 	_ = l.file.Close()
-	backup := l.path + ".1"
-	_ = os.Remove(backup)
-	_ = os.Rename(l.path, backup)
+	l.file = nil
+	*bw = nil
+
+	if !l.archiveEnabled {
+		backup := l.path + ".1"
+		_ = os.Remove(backup)
+		_ = os.Rename(l.path, backup)
+	} else {
+		l.compressSegmentAtomic(l.path, time.Now().UTC())
+	}
+
 	nf, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		l.file = nil
-		*bw = nil
+		l.written = 0
 		return
 	}
 	l.file = nf
 	l.written = 0
 	*bw = bufio.NewWriterSize(nf, loggerBufSize)
+	if l.archiveEnabled {
+		l.pruneArchivesLocked()
+	}
 }
 
 func (l *EventLogger) writerLoop() {
@@ -224,7 +577,8 @@ func (l *EventLogger) writerLoop() {
 	if l.file != nil {
 		bw = bufio.NewWriterSize(l.file, loggerBufSize)
 	}
-	flushTimer := time.NewTimer(loggerFlushCadence)
+
+	flushTimer := time.NewTimer(l.flushCadence)
 	if !flushTimer.Stop() {
 		select {
 		case <-flushTimer.C:
@@ -232,11 +586,46 @@ func (l *EventLogger) writerLoop() {
 		}
 	}
 	defer flushTimer.Stop()
-	dirty := false
 
-	writeRecord := func(rec LogRecord) {
-		if obs := l.observer.Load(); obs != nil && *obs != nil {
-			(*obs)(rec)
+	dirty := false
+	timerArmed := false
+	var timerTargetDelay time.Duration
+
+	stopFlush := func() {
+		if timerArmed {
+			if !flushTimer.Stop() {
+				select {
+				case <-flushTimer.C:
+				default:
+				}
+			}
+			timerArmed = false
+			timerTargetDelay = 0
+		}
+	}
+
+	armFlush := func(d time.Duration) {
+		if d <= 0 {
+			d = l.flushCadence
+		}
+		if timerArmed {
+			if d >= timerTargetDelay {
+				return
+			}
+			stopFlush()
+		}
+		flushTimer.Reset(d)
+		timerArmed = true
+		timerTargetDelay = d
+	}
+
+	activeClusters := make(map[string]*pendingCluster)
+
+	emitRecord := func(rec LogRecord, notifyObserver bool) {
+		if notifyObserver {
+			if obs := l.observer.Load(); obs != nil && *obs != nil {
+				(*obs)(rec)
+			}
 		}
 		if bw == nil {
 			return
@@ -250,7 +639,7 @@ func (l *EventLogger) writerLoop() {
 		l.written += int64(n1 + 1)
 		if !dirty {
 			dirty = true
-			flushTimer.Reset(loggerFlushCadence)
+			armFlush(l.flushCadence)
 		}
 		if l.written >= l.maxBytes {
 			l.rotateLocked(&bw)
@@ -258,23 +647,193 @@ func (l *EventLogger) writerLoop() {
 		}
 	}
 
+	flushCluster := func(c *pendingCluster, now time.Time) {
+		if c == nil {
+			return
+		}
+		delete(activeClusters, c.sig)
+		if c.count <= 0 {
+			return
+		}
+		nowUTC := now.UTC()
+		clustered := LogRecord{
+			SchemaVersion: logSchemaVersion,
+			UnixMS:        nowUTC.UnixMilli(),
+			Timestamp:     nowUTC.Format(time.RFC3339Nano),
+			SessionID:     c.sessionID,
+			Event:         c.event,
+			Severity:      c.severity,
+			ClusterSig:    c.sig,
+			RepeatCount:   c.count,
+			FirstUnixMS:   c.firstUnixMS,
+			LastUnixMS:    c.lastUnixMS,
+			Fields:        c.sampleFields,
+		}
+		// Avoid duplicating a 4th Terminal line for small <=3 bursts already visible live, while surfacing larger storms.
+		emitRecord(clustered, c.count > uiImmediateBurstLimit-1)
+	}
+
+	flushExpiredClusters := func(now time.Time) {
+		for _, c := range activeClusters {
+			if now.Sub(c.firstAt) >= l.clusterWindow {
+				flushCluster(c, now)
+			}
+		}
+	}
+
+	flushTunnelClusters := func(tunnelID string, now time.Time) {
+		if tunnelID == "" {
+			return
+		}
+		for _, c := range activeClusters {
+			if c.tunnelID == tunnelID {
+				flushCluster(c, now)
+			}
+		}
+	}
+
+	flushAllClusters := func(now time.Time) {
+		for _, c := range activeClusters {
+			flushCluster(c, now)
+		}
+	}
+
+	evictOldestCluster := func(now time.Time) {
+		var oldest *pendingCluster
+		for _, c := range activeClusters {
+			if oldest == nil || c.firstAt.Before(oldest.firstAt) {
+				oldest = c
+			}
+		}
+		if oldest != nil {
+			flushCluster(oldest, now)
+		}
+	}
+
+	nextClusterWakeDelay := func(now time.Time) (time.Duration, bool) {
+		var minRem time.Duration
+		found := false
+		for _, c := range activeClusters {
+			if c.count <= 0 {
+				continue
+			}
+			rem := l.clusterWindow - now.Sub(c.firstAt)
+			if rem < 10*time.Millisecond {
+				rem = 10 * time.Millisecond
+			}
+			if !found || rem < minRem {
+				minRem = rem
+				found = true
+			}
+		}
+		return minRem, found
+	}
+
+	scheduleNextWake := func(now time.Time) {
+		if dirty {
+			armFlush(l.flushCadence)
+			return
+		}
+		if rem, ok := nextClusterWakeDelay(now); ok {
+			armFlush(rem)
+		}
+	}
+
+	processRecord := func(rec LogRecord) {
+		now := time.Now().UTC()
+		flushExpiredClusters(now)
+
+		if !isClusterableEvent(rec.Event) {
+			switch rec.Event {
+			case "WORKER_BOOT_OK", "WORKER_RECOVERED":
+				flushTunnelClusters(fieldString(rec.Fields, "tunnel_id"), now)
+			case "SESSION_ROLLUP", "SHUTDOWN_COMPLETE", "SESSION_STOP":
+				flushAllClusters(now)
+			}
+			emitRecord(rec, true)
+			scheduleNextWake(now)
+			return
+		}
+
+		tunnelID := fieldString(rec.Fields, "tunnel_id")
+		sig := normalizeClusterSignature(rec.Event, tunnelID, extractClusterErrText(rec))
+		c, exists := activeClusters[sig]
+		if !exists {
+			if len(activeClusters) >= maxActiveClusters {
+				evictOldestCluster(now)
+			}
+			emitRecord(rec, true)
+			activeClusters[sig] = &pendingCluster{
+				sig:          sig,
+				event:        rec.Event,
+				severity:     rec.Severity,
+				sessionID:    rec.SessionID,
+				tunnelID:     tunnelID,
+				firstAt:      now,
+				lastAt:       now,
+				uiForwarded:  1,
+				sampleFields: rec.Fields,
+			}
+			scheduleNextWake(now)
+			return
+		}
+
+		c.count++
+		l.dedupedCount.Add(1)
+		c.lastAt = now
+		if c.firstUnixMS == 0 || rec.UnixMS < c.firstUnixMS {
+			c.firstUnixMS = rec.UnixMS
+		}
+		if rec.UnixMS > c.lastUnixMS {
+			c.lastUnixMS = rec.UnixMS
+		}
+		if c.uiForwarded < uiImmediateBurstLimit {
+			c.uiForwarded++
+			if obs := l.observer.Load(); obs != nil && *obs != nil {
+				(*obs)(rec)
+			}
+		}
+		if c.count >= maxClusterRepeatCount {
+			flushCluster(c, now)
+		}
+		scheduleNextWake(now)
+	}
+
 	for {
 		select {
 		case rec := <-l.ch:
-			writeRecord(rec)
+			processRecord(rec)
 		case <-flushTimer.C:
+			l.timerWakeCount.Add(1)
+			timerArmed = false
+			timerTargetDelay = 0
+			now := time.Now().UTC()
+			flushExpiredClusters(now)
 			if bw != nil && dirty {
 				_ = bw.Flush()
+				l.flushCount.Add(1)
+				dirty = false
 			}
-			dirty = false
+			scheduleNextWake(now)
 		case <-l.quitCh:
+			stopFlush()
 			for {
 				select {
 				case rec := <-l.ch:
-					writeRecord(rec)
+					processRecord(rec)
 				default:
+					flushAllClusters(time.Now().UTC())
 					if bw != nil {
-						_ = bw.Flush()
+						if dirty {
+							_ = bw.Flush()
+							l.flushCount.Add(1)
+							dirty = false
+						} else {
+							_ = bw.Flush()
+						}
+					}
+					if l.archiveEnabled {
+						l.pruneArchivesLocked()
 					}
 					if l.file != nil {
 						_ = l.file.Sync()
@@ -302,12 +861,13 @@ func (l *EventLogger) Close() error {
 // TerminalLine is one bounded, UTF-8-safe, secret-redacted entry stored in TerminalRingBuffer.
 type TerminalLine struct {
 	Seq       int64  `json:"seq"`
+	UnixMS    int64  `json:"unix_ms"`
 	Timestamp string `json:"ts"`
 	Level     string `json:"level"`
 	Text      string `json:"text"`
 }
 
-// TerminalRingBuffer provides O(1) bounded memory (500 lines x <=256B) for mobile Terminal tab.
+// TerminalRingBuffer provides O(1) bounded memory (2500 lines x <=384B) for mobile Terminal tab.
 type TerminalRingBuffer struct {
 	mu      sync.Mutex
 	lines   [TerminalRingCapacity]TerminalLine
@@ -355,11 +915,15 @@ func (rb *TerminalRingBuffer) AppendAt(ts time.Time, sev LogSeverity, text strin
 	if rb == nil {
 		return TerminalLine{}
 	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
 	clean := truncateUTF8(text, TerminalMaxLineBytes)
 	if clean == "" {
 		return TerminalLine{}
 	}
 	entry := TerminalLine{
+		UnixMS:    ts.UnixMilli(),
 		Timestamp: ts.Format("15:04:05"),
 		Level:     sev.String(),
 		Text:      clean,
@@ -419,8 +983,67 @@ func (rb *TerminalRingBuffer) Clear() {
 	rb.mu.Unlock()
 }
 
+func formatCompactBytesGo(v any) string {
+	var b float64
+	switch n := v.(type) {
+	case uint64:
+		b = float64(n)
+	case int64:
+		if n > 0 {
+			b = float64(n)
+		}
+	case int:
+		if n > 0 {
+			b = float64(n)
+		}
+	case float64:
+		if n > 0 {
+			b = n
+		}
+	}
+	const (
+		kb = 1024.0
+		mb = kb * 1024.0
+		gb = mb * 1024.0
+	)
+	switch {
+	case b >= gb:
+		return fmt.Sprintf("%.2fGB", b/gb)
+	case b >= mb:
+		return fmt.Sprintf("%.1fMB", b/mb)
+	case b >= kb:
+		return fmt.Sprintf("%.0fKB", b/kb)
+	default:
+		return fmt.Sprintf("%.0fB", b)
+	}
+}
+
+func formatCompactMSGo(v any) string {
+	var ms float64
+	switch n := v.(type) {
+	case float64:
+		ms = n
+	case int64:
+		ms = float64(n)
+	case int:
+		ms = float64(n)
+	}
+	if ms <= 0 {
+		return "--"
+	}
+	return fmt.Sprintf("%.0fms", ms)
+}
+
 // FormatLogRecord converts an EventLogger record into a concise human-readable terminal line.
 func FormatLogRecord(rec LogRecord) (LogSeverity, string) {
+	sev, text := formatLogRecordBase(rec)
+	if rec.RepeatCount > 0 && rec.ClusterSig != "" {
+		text = fmt.Sprintf("%s (x%d clustered)", text, rec.RepeatCount)
+	}
+	return sev, text
+}
+
+func formatLogRecordBase(rec LogRecord) (LogSeverity, string) {
 	sev := LogInfo
 	f := rec.Fields
 	sf := func(k string) string {
@@ -447,6 +1070,53 @@ func FormatLogRecord(rec LogRecord) (LogSeverity, string) {
 	case "SESSION_START":
 		return LogInfo, fmt.Sprintf("[Start] codespace=%s local=%s pool=%s max_ch=%s",
 			sf("codespace"), sf("local_addr"), sf("pool_size"), sf("max_conns"))
+	case "POOL_SUMMARY":
+		st := sf("state")
+		if st == string(StateDegraded) {
+			sev = LogWarn
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "[Summary] state=%s power=%s mode=%s", st, sf("power_state"), sf("routing_mode"))
+		if pri := sf("primary_tunnel"); pri != "" {
+			fmt.Fprintf(&b, " pri=%s", pri)
+		}
+		fmt.Fprintf(&b, " pool=%s/%s active=%s p50=%s underlay=%s",
+			sf("healthy_workers"), sf("pool_size"), sf("active_conns"),
+			formatCompactMSGo(f["aggregate_p50_ms"]), formatCompactMSGo(f["underlay_baseline_ms"]))
+		if t1s := sf("t1_state"); t1s != "" {
+			if t1s == string(TunnelHealthy) {
+				fmt.Fprintf(&b, " t1=%s", formatCompactMSGo(f["t1_rtt_ms"]))
+			} else {
+				fmt.Fprintf(&b, " t1=%s", t1s)
+			}
+		}
+		if t2s := sf("t2_state"); t2s != "" {
+			if t2s == string(TunnelHealthy) {
+				fmt.Fprintf(&b, " t2=%s", formatCompactMSGo(f["t2_rtt_ms"]))
+			} else {
+				fmt.Fprintf(&b, " t2=%s", t2s)
+			}
+		}
+		upSrc := f["total_bytes_up"]
+		if upSrc == nil {
+			upSrc = f["bytes_up_window"]
+		}
+		downSrc := f["total_bytes_down"]
+		if downSrc == nil {
+			downSrc = f["bytes_down_window"]
+		}
+		wafMax5m := sf("waf_max_5m")
+		if wafMax5m == "" {
+			wafMax5m = "6"
+		}
+		fmt.Fprintf(&b, " up=%s down=%s waf=%s/%s",
+			formatCompactBytesGo(upSrc), formatCompactBytesGo(downSrc), sf("waf_5m"), wafMax5m)
+		return sev, b.String()
+	case "SESSION_ROLLUP":
+		return LogInfo, fmt.Sprintf("[Session] dur=%ss up=%s down=%s failovers=%s pri_sw=%s evicts=%s deduped=%s segs=%s reason=%s",
+			sf("duration_sec"), formatCompactBytesGo(f["total_bytes_up"]), formatCompactBytesGo(f["total_bytes_down"]),
+			sf("total_failovers"), sf("primary_switches"), sf("slow_lane_evictions"),
+			sf("clustered_errors_deduped"), sf("archive_segments_count"), sf("stop_reason"))
 	case "SHUTDOWN_COMPLETE":
 		return LogInfo, fmt.Sprintf("[Stop] done (%s) | stop_invoked=%s", sf("reason"), sf("stop_codespace_invoked"))
 	case "POOL_WORKER_FAILOVER":
