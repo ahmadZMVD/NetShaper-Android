@@ -190,10 +190,12 @@ fun MainScreen(viewModel: NetShaperViewModel) {
                             onCopyLine = { line ->
                                 viewModel.copyText(
                                     label = "NetShaper Log Line",
-                                    text = "${line.ts} [${line.level}] ${line.text}",
+                                    text = "${line.formattedLocalTime()} [${line.level}] ${line.text}",
                                     toast = "Copied log line"
                                 )
-                            }
+                            },
+                            onExportRecentLogs = viewModel::exportRecentLogsToUri,
+                            onExportFullArchive = viewModel::exportFullArchiveToUri
                         )
 
                         MainTab.ACCOUNT -> AccountScreen(
