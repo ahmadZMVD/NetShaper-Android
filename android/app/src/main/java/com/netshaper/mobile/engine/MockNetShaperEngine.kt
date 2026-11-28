@@ -2,8 +2,6 @@ package com.netshaper.mobile.engine
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
@@ -14,7 +12,7 @@ import kotlin.random.Random
 
 /**
  * Interactive Phase-3 engine simulator matching mobilecore's JSON schemas byte-for-byte.
- * Simulates realistic 2-worker telemetry (PMTU=576 8K framing), live 500-line ring logs,
+ * Simulates realistic 2-worker telemetry (PMTU=576 8K framing), live 2500-line ring logs,
  * network handover / PAUSED_OFFLINE, adaptive IDLE_DEEP (2->1) parking, OAuth Device Flow,
  * Codespaces listing, and on-demand quota checks with HTTP 403 billing isolation.
  */
@@ -24,7 +22,6 @@ class MockNetShaperEngine : NetShaperEngine {
     private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "netshaper-mock-engine").apply { isDaemon = true }
     }
-    private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private var tickTask: ScheduledFuture<*>? = null
     private var callback: NetShaperCallback? = null
@@ -62,7 +59,7 @@ class MockNetShaperEngine : NetShaperEngine {
     private var mockCodespaceState: String = "Available"
 
     private var nextSeq: Long = 0L
-    private val logRing = ArrayDeque<TerminalLogLine>(500)
+    private val logRing = ArrayDeque<TerminalLogLine>(2500)
 
     init {
         appendLog(
@@ -228,7 +225,11 @@ class MockNetShaperEngine : NetShaperEngine {
 
                     if (tickCount % 15L == 0L) {
                         val hw = if (powerState == "IDLE_DEEP") 1 else poolSize
-                        logEvent = "INFO" to "[Stats] workers=$hw/$poolSize p50=${rtt1.roundToInt()}ms active=$activeConns/64 power=$powerState net=$networkType"
+                        val t2Summary = if (poolSize >= 2) {
+                            val t2Status = if (powerState == "IDLE_DEEP") "PARKED" else "OK"
+                            " t2=$t2Status(p50=${rtt2.roundToInt()}ms,r=$totalRouted2)"
+                        } else ""
+                        logEvent = "INFO" to "[Summary] pool=$hw/$poolSize t1=OK(p50=${rtt1.roundToInt()}ms,r=$totalRouted1)$t2Summary active=$activeConns/64 power=$powerState net=$networkType(metered=$isMetered) waf=$guardCalls5m/5m"
                     }
                 }
             }
@@ -336,6 +337,7 @@ class MockNetShaperEngine : NetShaperEngine {
             if (ln.seq > sinceSeq) {
                 arr.put(JSONObject().apply {
                     put("seq", ln.seq)
+                    put("unix_ms", ln.unixMs)
                     put("ts", ln.ts)
                     put("level", ln.level)
                     put("text", ln.text)
@@ -498,15 +500,17 @@ class MockNetShaperEngine : NetShaperEngine {
         val line: TerminalLogLine
         val cb: NetShaperCallback?
         val fg: Boolean
+        val nowMs = System.currentTimeMillis()
         synchronized(lock) {
             nextSeq++
             line = TerminalLogLine(
                 seq = nextSeq,
-                ts = timeFmt.format(Date()),
+                unixMs = nowMs,
+                ts = TerminalLogLine.formatEpochLocalTime(nowMs),
                 level = level,
                 text = text
             )
-            if (logRing.size >= 500) logRing.removeFirst()
+            if (logRing.size >= 2500) logRing.removeFirst()
             logRing.addLast(line)
             cb = callback
             fg = appInForeground

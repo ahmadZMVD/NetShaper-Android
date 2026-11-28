@@ -2,6 +2,9 @@ package com.netshaper.mobile.engine
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 enum class VpnBypassState {
@@ -186,19 +189,39 @@ data class MobileSnapshot(
 
 data class TerminalLogLine(
     val seq: Long,
+    val unixMs: Long = 0L,
     val ts: String,
     val level: String,
     val text: String
 ) {
+    fun formattedLocalTime(): String {
+        if (unixMs > 0L) {
+            return Instant.ofEpochMilli(unixMs)
+                .atZone(ZoneId.systemDefault())
+                .format(LOCAL_TIME_FORMATTER)
+        }
+        return ts.ifBlank { "--:--:--" }
+    }
+
     companion object {
+        private val LOCAL_TIME_FORMATTER: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US)
+
+        fun formatEpochLocalTime(unixMs: Long): String =
+            Instant.ofEpochMilli(unixMs)
+                .atZone(ZoneId.systemDefault())
+                .format(LOCAL_TIME_FORMATTER)
+
         fun listFromJson(raw: String): List<TerminalLogLine> = runCatching {
             val arr = JSONArray(raw)
             buildList(arr.length()) {
                 for (i in 0 until arr.length()) {
                     val o = arr.optJSONObject(i) ?: continue
+                    val unixMs = o.optLong("unix_ms", 0L)
                     add(
                         TerminalLogLine(
                             seq = o.optLong("seq", 0L),
+                            unixMs = unixMs,
                             ts = o.optString("ts", ""),
                             level = o.optString("level", "INFO"),
                             text = o.optString("text", "")
