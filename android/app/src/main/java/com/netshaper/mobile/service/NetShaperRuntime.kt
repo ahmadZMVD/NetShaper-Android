@@ -23,9 +23,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -38,6 +35,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - [engineCallback] never re-enters JNI synchronously from Go callback threads.
  */
 object NetShaperRuntime {
+
+    const val MAX_TERMINAL_LINES = 2500
 
     val isNativeCore: Boolean
         get() = EngineProvider.isNativeCore
@@ -53,7 +52,6 @@ object NetShaperRuntime {
     @Volatile private var cachedPrefsStore: AppPreferencesStore? = null
 
     private val logLock = Any()
-    private val timeFmt = ThreadLocal.withInitial { SimpleDateFormat("HH:mm:ss", Locale.US) }
 
     private val _snapshot = MutableStateFlow(MobileSnapshot())
     val snapshot: StateFlow<MobileSnapshot> = _snapshot.asStateFlow()
@@ -106,11 +104,18 @@ object NetShaperRuntime {
 
         override fun onLogLine(seq: Long, level: String, text: String) {
             if (text.isBlank()) return
-            val ts = timeFmt.get()?.format(Date()) ?: "00:00:00"
-            val entry = TerminalLogLine(seq = seq, ts = ts, level = level, text = text)
+            val nowMs = System.currentTimeMillis()
+            val ts = TerminalLogLine.formatEpochLocalTime(nowMs)
+            val entry = TerminalLogLine(
+                seq = seq,
+                unixMs = nowMs,
+                ts = ts,
+                level = level,
+                text = text
+            )
             synchronized(logLock) {
                 if (seq <= lastLogSeq) return
-                val merged = (_logs.value + entry).takeLast(500)
+                val merged = (_logs.value + entry).takeLast(MAX_TERMINAL_LINES)
                 lastLogSeq = entry.seq
                 _logs.value = merged
             }
@@ -128,6 +133,8 @@ object NetShaperRuntime {
         return dir.absolutePath
     }
 
+    fun logDirectory(context: Context): File = File(dataDirPath(context))
+
     fun refreshSnapshot(): MobileSnapshot {
         val parsed = MobileSnapshot.fromJson(engine.getSnapshotJson())
         _snapshot.value = parsed
@@ -142,7 +149,7 @@ object NetShaperRuntime {
         synchronized(logLock) {
             val fresh = delta.filter { it.seq > lastLogSeq }
             if (fresh.isEmpty()) return
-            val merged = (_logs.value + fresh).takeLast(500)
+            val merged = (_logs.value + fresh).takeLast(MAX_TERMINAL_LINES)
             lastLogSeq = merged.lastOrNull()?.seq ?: lastLogSeq
             _logs.value = merged
         }
