@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// ErrBootAbortedForHandover is returned by BootAndQualify when a network handover or
+// offline pause cancels an in-flight dial/handshake/probe so superviseWorker resets cleanly.
+var ErrBootAbortedForHandover = errors.New("boot aborted for network handover or offline pause")
+
 type TunnelState string
 
 const (
@@ -81,6 +85,12 @@ type TunnelInstance struct {
 
 	sessMu  sync.RWMutex
 	session WorkerSession
+
+	bootCancelMu      sync.Mutex
+	activeBootCancel  context.CancelFunc
+	bootAbortReason   string
+	managedByPool     atomic.Bool
+	lastBootElapsedMS atomic.Int64
 
 	evictCh chan string
 }
@@ -216,12 +226,53 @@ func (t *TunnelInstance) ResetEvictionState() {
 	t.evictDeferLogged.Store(false)
 }
 
+func (t *TunnelInstance) setActiveBootCancel(cancel context.CancelFunc) {
+	t.bootCancelMu.Lock()
+	t.activeBootCancel = cancel
+	t.bootAbortReason = ""
+	t.bootCancelMu.Unlock()
+}
+
+func (t *TunnelInstance) clearActiveBootCancel() string {
+	t.bootCancelMu.Lock()
+	reason := t.bootAbortReason
+	t.activeBootCancel = nil
+	t.bootAbortReason = ""
+	t.bootCancelMu.Unlock()
+	return reason
+}
+
+func (t *TunnelInstance) currentBootAbortReason() string {
+	t.bootCancelMu.Lock()
+	reason := t.bootAbortReason
+	t.bootCancelMu.Unlock()
+	return reason
+}
+
+func (t *TunnelInstance) LastBootElapsedMS() int64 {
+	return t.lastBootElapsedMS.Load()
+}
+
 func (t *TunnelInstance) TriggerEviction(reason string) bool {
+	var bootCancel context.CancelFunc
+	if reason == "network_handover" || reason == "paused_offline" {
+		t.bootCancelMu.Lock()
+		if t.activeBootCancel != nil {
+			if t.bootAbortReason == "" {
+				t.bootAbortReason = reason
+			}
+			bootCancel = t.activeBootCancel
+		}
+		t.bootCancelMu.Unlock()
+	}
+	if bootCancel != nil {
+		bootCancel()
+	}
 	select {
 	case t.evictCh <- reason:
 		return true
 	default:
-		return false
+		return bootCancel != nil
 	}
 }
 
@@ -435,10 +486,21 @@ func (t *TunnelInstance) BootAndQualify(
 		if effBootTimeout >= 60*time.Second && effBootTimeout < 120*time.Second {
 			effBootTimeout = 120 * time.Second
 		}
-		bootCtx, cancelBoot := context.WithTimeout(ctx, effBootTimeout)
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		t.setActiveBootCancel(cancelAttempt)
+
+		bootCtx, cancelBoot := context.WithTimeout(attemptCtx, effBootTimeout)
 		sess, err := t.transport.Connect(bootCtx, t.id)
 		cancelBoot()
 		if err != nil {
+			abortReason := t.clearActiveBootCancel()
+			cancelAttempt()
+			if abortReason != "" && ctx.Err() == nil {
+				if sess != nil {
+					_ = sess.Close()
+				}
+				return nil, BootQualityReport{}, fmt.Errorf("%w: %s", ErrBootAbortedForHandover, abortReason)
+			}
 			var fatalErr *FatalBootError
 			if errors.As(err, &fatalErr) {
 				if t.logger != nil {
@@ -450,10 +512,12 @@ func (t *TunnelInstance) BootAndQualify(
 				}
 				return nil, BootQualityReport{}, fatalErr
 			}
-			if t.logger != nil && ctx.Err() == nil {
+			elapsedMS := time.Since(bootStart).Milliseconds()
+			t.lastBootElapsedMS.Store(elapsedMS)
+			if t.logger != nil && ctx.Err() == nil && !t.managedByPool.Load() {
 				t.logger.Log("WORKER_BOOT_FAIL", map[string]any{
 					"tunnel_id":  t.id,
-					"elapsed_ms": time.Since(bootStart).Milliseconds(),
+					"elapsed_ms": elapsedMS,
 					"error":      RedactSecrets(err.Error()),
 				})
 			}
@@ -471,19 +535,32 @@ func (t *TunnelInstance) BootAndQualify(
 			if i > 0 && t.sampleDel > 0 {
 				tm := time.NewTimer(t.sampleDel)
 				select {
-				case <-ctx.Done():
+				case <-attemptCtx.Done():
 					tm.Stop()
+					abortReason := t.clearActiveBootCancel()
+					cancelAttempt()
 					_ = sess.Close()
+					if abortReason != "" && ctx.Err() == nil {
+						return nil, BootQualityReport{}, fmt.Errorf("%w: %s", ErrBootAbortedForHandover, abortReason)
+					}
 					return nil, BootQualityReport{}, ctx.Err()
 				case <-sess.Done():
 					tm.Stop()
+					t.clearActiveBootCancel()
+					cancelAttempt()
 					_ = sess.Close()
 					return nil, BootQualityReport{}, errors.New("session dropped during boot qualification")
 				case <-tm.C:
 				}
 			}
-			rtt, pErr := t.probeFn(ctx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
+			rtt, pErr := t.probeFn(attemptCtx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
 			if pErr != nil {
+				if abortReason := t.currentBootAbortReason(); abortReason != "" && ctx.Err() == nil {
+					t.clearActiveBootCancel()
+					cancelAttempt()
+					_ = sess.Close()
+					return nil, BootQualityReport{}, fmt.Errorf("%w: %s", ErrBootAbortedForHandover, abortReason)
+				}
 				if t.logger != nil && ctx.Err() == nil {
 					t.logger.Log("WORKER_PROBE_FAIL", map[string]any{
 						"tunnel_id": t.id,
@@ -512,8 +589,14 @@ func (t *TunnelInstance) BootAndQualify(
 		var microRTT time.Duration
 		if t.cfg.BootMicroPayloadCheck && failures == 0 && t.cfg.BootQualitySamples > 1 {
 			var mpErr error
-			microRTT, mpErr = t.microFn(ctx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
+			microRTT, mpErr = t.microFn(attemptCtx, sess, t.cfg.ProbeTarget, t.cfg.ProbeTimeout)
 			if mpErr != nil {
+				if abortReason := t.currentBootAbortReason(); abortReason != "" && ctx.Err() == nil {
+					t.clearActiveBootCancel()
+					cancelAttempt()
+					_ = sess.Close()
+					return nil, BootQualityReport{}, fmt.Errorf("%w: %s", ErrBootAbortedForHandover, abortReason)
+				}
 				microOK = false
 				if t.logger != nil && ctx.Err() == nil {
 					t.logger.Log("WORKER_PROBE_FAIL", map[string]any{
@@ -579,16 +662,31 @@ func (t *TunnelInstance) BootAndQualify(
 			_ = sess.Close()
 			tm := time.NewTimer(t.retryDel)
 			select {
-			case <-ctx.Done():
+			case <-attemptCtx.Done():
 				tm.Stop()
+				abortReason := t.clearActiveBootCancel()
+				cancelAttempt()
+				if abortReason != "" && ctx.Err() == nil {
+					return nil, BootQualityReport{}, fmt.Errorf("%w: %s", ErrBootAbortedForHandover, abortReason)
+				}
 				return nil, BootQualityReport{}, ctx.Err()
 			case <-tm.C:
 			}
+			t.clearActiveBootCancel()
+			cancelAttempt()
 			continue
+		}
+
+		abortReason := t.clearActiveBootCancel()
+		cancelAttempt()
+		if abortReason != "" && ctx.Err() == nil {
+			_ = sess.Close()
+			return nil, BootQualityReport{}, fmt.Errorf("%w: %s", ErrBootAbortedForHandover, abortReason)
 		}
 
 		if qRep.Failures > 0 && len(rtts) == 0 {
 			_ = sess.Close()
+			t.lastBootElapsedMS.Store(bootDuration.Milliseconds())
 			return nil, BootQualityReport{}, fmt.Errorf("boot qualification failed: 0/%d probes succeeded (target=%s)", samples, t.cfg.ProbeTarget)
 		}
 

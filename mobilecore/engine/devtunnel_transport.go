@@ -136,6 +136,10 @@ type DevTunnelSSHTransport struct {
 	hb           *HeartbeatCoordinator
 	logger       *EventLogger
 	directClient *http.Client
+
+	zombieMu       sync.Mutex
+	zombieGen      uint64
+	zombieRPCCount int
 }
 
 func NewDevTunnelSSHTransport(cfg Config, creds *CredentialManager, resolver *AntiPoisonResolver, hb *HeartbeatCoordinator, logger *EventLogger) *DevTunnelSSHTransport {
@@ -159,6 +163,87 @@ func NewDevTunnelSSHTransport(cfg Config, creds *CredentialManager, resolver *An
 		logger:       logger,
 		directClient: &http.Client{Transport: tr, Timeout: 25 * time.Second},
 	}
+}
+
+func (t *DevTunnelSSHTransport) CloseIdleConnections() {
+	if t == nil || t.directClient == nil {
+		return
+	}
+	if tr, ok := t.directClient.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+}
+
+func (t *DevTunnelSSHTransport) recordStageRPCFailure(gen uint64) int {
+	t.zombieMu.Lock()
+	if t.zombieGen != gen {
+		t.zombieGen = gen
+		t.zombieRPCCount = 0
+	}
+	t.zombieRPCCount++
+	cnt := t.zombieRPCCount
+	t.zombieMu.Unlock()
+	return cnt
+}
+
+func (t *DevTunnelSSHTransport) resetStageRPCFailure(gen uint64) {
+	t.zombieMu.Lock()
+	if t.zombieGen == gen {
+		t.zombieRPCCount = 0
+	}
+	t.zombieMu.Unlock()
+}
+
+func isStaleDevTunnelHTTPStatus(status int) bool {
+	return status == http.StatusUnauthorized ||
+		status == http.StatusForbidden ||
+		status == http.StatusNotFound ||
+		status == http.StatusGone
+}
+
+func isDeadVMStartServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "StartRemoteServerAsync rejected:")
+}
+
+func isZombieRPCDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	low := strings.ToLower(err.Error())
+	for _, tok := range []string{
+		"grpc status 4",
+		"deadline exceeded",
+		"context deadline exceeded",
+		"client.timeout",
+		"rpc http 5",
+		"eof",
+		"connect failed",
+		"unknown channel type",
+		"prohibited",
+	} {
+		if strings.Contains(low, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractRelayEndpoint(doc devTunnelRESTDoc) (relayURI, epMode string, hostPubKeys []string) {
+	for _, ep := range doc.Endpoints {
+		if strings.EqualFold(ep.ConnectionMode, "TunnelRelay") && ep.ClientRelayURI != "" {
+			return ep.ClientRelayURI, ep.ConnectionMode, ep.HostPublicKeys
+		}
+	}
+	if len(doc.Endpoints) > 0 {
+		return doc.Endpoints[0].ClientRelayURI, doc.Endpoints[0].ConnectionMode, doc.Endpoints[0].HostPublicKeys
+	}
+	return "", "", nil
 }
 
 func (t *DevTunnelSSHTransport) logStage(workerID, stage, detail string) {
@@ -292,7 +377,7 @@ func (t *DevTunnelSSHTransport) fetchDevTunnel(ctx context.Context, props Tunnel
 	return doc, resp.StatusCode, nil
 }
 
-func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props TunnelProperties, clusterFallback string, port uint16) error {
+func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props TunnelProperties, clusterFallback string, port uint16) (int, error) {
 	tok := props.ManagePortsAccessToken
 	if tok == "" {
 		tok = props.ConnectAccessToken
@@ -313,11 +398,11 @@ func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props T
 		Labels:     []string{"InternalPort"},
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Authorization", "tunnel "+tok)
 	req.Header.Set("Content-Type", "application/json")
@@ -327,16 +412,16 @@ func (t *DevTunnelSSHTransport) ensureDevTunnelPort(ctx context.Context, props T
 	hc := t.newDirectHTTPClient()
 	resp, err := hc.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if (resp.StatusCode >= 200 && resp.StatusCode < 300) ||
 		resp.StatusCode == http.StatusConflict ||
 		resp.StatusCode == http.StatusPreconditionFailed {
-		return nil
+		return resp.StatusCode, nil
 	}
-	return fmt.Errorf("devtunnels PUT port %d HTTP %d: %s", port, resp.StatusCode, RedactSecrets(strings.TrimSpace(string(body))))
+	return resp.StatusCode, fmt.Errorf("devtunnels PUT port %d HTTP %d: %s", port, resp.StatusCode, RedactSecrets(strings.TrimSpace(string(body))))
 }
 
 func preferredInnerSSHCiphers() []string {
@@ -402,7 +487,7 @@ func buildOuterHostKeyCallback(hostKeys []string) (ssh.HostKeyCallback, int) {
 // Connect establishes a brand-new independent outer WAN TCP + TLS + WSS + Outer SSH + Inner SSH session.
 func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (WorkerSession, error) {
 	t.logStage(workerID, "1/7", "resolving codespace DevTunnels JWT")
-	props, err := t.creds.Get(ctx, false)
+	props, credGen, err := t.creds.GetWithGen(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("[1/7 codespace creds] %w", err)
 	}
@@ -410,34 +495,56 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 
 	t.logStage(workerID, "2/7", fmt.Sprintf("GET %s/tunnels", safeURIHost(normalizeDevTunnelsAPIBase(props.ServiceURI, props.ClusterID))))
 	doc, status, err := t.fetchDevTunnel(ctx, props)
-	if err != nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
-		t.logStage(workerID, "2/7", fmt.Sprintf("HTTP %d from DevTunnels REST, invalidating JWT & refreshing", status))
-		t.creds.Invalidate()
-		props, err = t.creds.Get(ctx, true)
-		if err != nil {
-			return nil, fmt.Errorf("[2/7 devtunnel jwt refresh] %w", err)
+	var relayURI, epMode string
+	var hostPubKeys []string
+	if err == nil {
+		relayURI, epMode, hostPubKeys = extractRelayEndpoint(doc)
+	}
+	staleReason := ""
+	if ctx.Err() == nil {
+		if err != nil && isStaleDevTunnelHTTPStatus(status) {
+			staleReason = fmt.Sprintf("http_%d", status)
+		} else if err == nil && relayURI == "" {
+			staleReason = "empty_endpoints"
 		}
-		doc, _, err = t.fetchDevTunnel(ctx, props)
+	}
+	if staleReason != "" {
+		staleID := props.TunnelID
+		invalidated, coolRem := t.creds.InvalidateIfMatch(credGen, staleReason)
+		if invalidated {
+			if err != nil {
+				t.logStage(workerID, "2/7", fmt.Sprintf("HTTP %d (stale tunnel_id=%s) — refreshing Codespace & DevTunnels JWT", status, staleID))
+			} else {
+				t.logStage(workerID, "2/7", fmt.Sprintf("empty relay endpoints (stale tunnel_id=%s) — refreshing Codespace & DevTunnels JWT", staleID))
+			}
+			props, credGen, err = t.creds.GetWithGen(ctx, true)
+			if err != nil {
+				return nil, fmt.Errorf("[2/7 devtunnel jwt refresh] %w", err)
+			}
+			t.logStage(workerID, "2/7", fmt.Sprintf("GET %s/tunnels", safeURIHost(normalizeDevTunnelsAPIBase(props.ServiceURI, props.ClusterID))))
+			doc, _, err = t.fetchDevTunnel(ctx, props)
+			if err == nil {
+				relayURI, epMode, hostPubKeys = extractRelayEndpoint(doc)
+			}
+		} else if coolRem == 0 {
+			t.logStage(workerID, "2/7", fmt.Sprintf("stale tunnel_id=%s superseded by newer credential gen — retrying with fresh creds", staleID))
+			props, credGen, err = t.creds.GetWithGen(ctx, false)
+			if err != nil {
+				return nil, fmt.Errorf("[2/7 devtunnel jwt refresh] %w", err)
+			}
+			doc, _, err = t.fetchDevTunnel(ctx, props)
+			if err == nil {
+				relayURI, epMode, hostPubKeys = extractRelayEndpoint(doc)
+			}
+		} else {
+			t.logStage(workerID, "2/7", fmt.Sprintf("stale tunnel_id=%s refresh throttled for %s (WAF guard)", staleID, coolRem.Round(time.Millisecond)))
+			if err == nil {
+				return nil, errors.New("[2/7 devtunnel GET] endpoint missing clientRelayUri (refresh throttled)")
+			}
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("[2/7 devtunnel GET] %w", err)
-	}
-
-	var relayURI string
-	var hostPubKeys []string
-	var epMode string
-	for _, ep := range doc.Endpoints {
-		if strings.EqualFold(ep.ConnectionMode, "TunnelRelay") && ep.ClientRelayURI != "" {
-			relayURI = ep.ClientRelayURI
-			hostPubKeys = ep.HostPublicKeys
-			epMode = ep.ConnectionMode
-			break
-		}
-	}
-	if relayURI == "" && len(doc.Endpoints) > 0 {
-		relayURI = doc.Endpoints[0].ClientRelayURI
-		hostPubKeys = doc.Endpoints[0].HostPublicKeys
-		epMode = doc.Endpoints[0].ConnectionMode
 	}
 	if relayURI == "" {
 		return nil, errors.New("[2/7 devtunnel GET] endpoint missing clientRelayUri")
@@ -477,8 +584,12 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 		Subprotocols: subprotocols,
 	})
 	if err != nil {
-		if wsResp != nil && (wsResp.StatusCode == http.StatusUnauthorized || wsResp.StatusCode == http.StatusForbidden) {
-			t.creds.Invalidate()
+		if ctx.Err() != nil {
+			t.CloseIdleConnections()
+			return nil, fmt.Errorf("[3/7 wss dial] %w", err)
+		}
+		if wsResp != nil && isStaleDevTunnelHTTPStatus(wsResp.StatusCode) {
+			t.creds.InvalidateIfMatch(credGen, fmt.Sprintf("wss_http_%d", wsResp.StatusCode))
 		}
 		httpCode := 0
 		if wsResp != nil {
@@ -559,6 +670,9 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 	outerConn, outerChans, outerReqs, err := ssh.NewClientConn(hostTransport, relayURI, outerCfg)
 	if err != nil {
 		cleanupOnErr(hostTransport, relaySSHConn, wsNetConn)
+		if ctx.Err() == nil && strings.Contains(err.Error(), "outer devtunnel host key mismatch") {
+			t.creds.InvalidateIfMatch(credGen, "outer_host_key_mismatch")
+		}
 		return nil, fmt.Errorf("[4/7 outer ssh] %w", err)
 	}
 	t.logStage(workerID, "4/7", fmt.Sprintf("outer ssh connected (host_keys=%d)", verifiedKeys))
@@ -577,7 +691,7 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 
 	// Wait for host to advertise port 16634 via tcpip-forward (or request RefreshPorts).
 	rpcReady := outer.waitForPort(ctx, codespaceRPCPort, 2500*time.Millisecond)
-	if !rpcReady {
+	if !rpcReady && ctx.Err() == nil {
 		_, _, _ = outerConn.SendRequest("RefreshPorts", true, nil)
 		rpcReady = outer.waitForPort(ctx, codespaceRPCPort, 5000*time.Millisecond)
 	}
@@ -625,8 +739,24 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 	}
 	if err != nil {
 		cleanupOnErr(outerConn, hostTransport, relaySSHConn, wsNetConn)
+		if ctx.Err() == nil {
+			if isDeadVMStartServerError(err) {
+				if inv, _ := t.creds.InvalidateIfMatch(credGen, "rpc_start_server_rejected"); inv {
+					t.logStage(workerID, "5/7", "VM SSH host rejected RPC — invalidated stale tunnel credentials for Codespace wake/refresh")
+				}
+				t.resetStageRPCFailure(credGen)
+			} else if !rpcReady || isZombieRPCDeadlineError(err) {
+				if cnt := t.recordStageRPCFailure(credGen); cnt >= 2 {
+					if inv, _ := t.creds.InvalidateIfMatch(credGen, "rpc_consecutive_zombie_failures"); inv {
+						t.logStage(workerID, "5/7", fmt.Sprintf("consecutive zombie RPC failures (count=%d) — invalidated stale tunnel credentials", cnt))
+					}
+					t.resetStageRPCFailure(credGen)
+				}
+			}
+		}
 		return nil, fmt.Errorf("[5/7 rpc StartRemoteServerAsync] %w", err)
 	}
+	t.resetStageRPCFailure(credGen)
 	if sshUser == "" {
 		sshUser = "codespace"
 	}
@@ -643,9 +773,13 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 			}
 		}
 		if !portInDoc {
-			putErr = t.ensureDevTunnelPort(ctx, props, doc.ClusterID, sshdPort)
+			var putStatus int
+			putStatus, putErr = t.ensureDevTunnelPort(ctx, props, doc.ClusterID, sshdPort)
 			if putErr != nil {
 				t.logStage(workerID, "6/7", fmt.Sprintf("PUT port %d warning: %s", sshdPort, putErr.Error()))
+				if ctx.Err() == nil && isStaleDevTunnelHTTPStatus(putStatus) {
+					t.creds.InvalidateIfMatch(credGen, fmt.Sprintf("port_put_http_%d", putStatus))
+				}
 			}
 		}
 		_, _, _ = outerConn.SendRequest("RefreshPorts", true, nil)
@@ -692,6 +826,8 @@ func (t *DevTunnelSSHTransport) Connect(ctx context.Context, workerID string) (W
 		}
 		return nil, context.Canceled
 	}
+
+	t.creds.MarkTunnelHealthy(credGen)
 
 	s := &devTunnelSession{
 		workerID:      workerID,

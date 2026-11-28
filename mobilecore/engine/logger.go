@@ -477,6 +477,8 @@ func FormatLogRecord(rec LogRecord) (LogSeverity, string) {
 		return LogError, fmt.Sprintf("[Fatal] %s", RedactSecrets(sf("message")))
 	case "GITHUB_TUNNEL_PROPS_MISSING":
 		return LogError, fmt.Sprintf("[GitHub] codespace=%s missing tunnelProperties (%s) — use Option A Device Flow", sf("codespace"), sf("keys"))
+	case "CREDENTIAL_INVALIDATED":
+		return LogWarn, fmt.Sprintf("[Auth] invalidated stale tunnel=%s reason=%s (gen=%s)", sf("tunnel_id"), sf("reason"), sf("stale_gen"))
 	case "WORKER_BOOT_STAGE":
 		return LogInfo, fmt.Sprintf("[Boot %s] %s: %s", sf("stage"), sf("tunnel_id"), RedactSecrets(sf("detail")))
 	case "WORKER_BOOT_FAIL":

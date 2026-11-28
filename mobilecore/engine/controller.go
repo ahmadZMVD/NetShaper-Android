@@ -142,11 +142,14 @@ type SessionController struct {
 	activeHB        *HeartbeatCoordinator
 
 	// Trailing-edge network handover debouncer.
-	netMu            sync.Mutex
-	netDebounceTimer *time.Timer
-	netPendingType   string
-	netPendingMeter  bool
-	netLastApplied   string
+	netMu                       sync.Mutex
+	netDebounceTimer            *time.Timer
+	netPendingType              string
+	netPendingMeter             bool
+	netLastApplied              string
+	netHasApplied               bool
+	netSawOfflineDuringDebounce bool
+	netSameTypeRefreshPending   bool
 
 	activeSup   atomic.Pointer[Supervisor]
 	latestSnap  atomic.Pointer[MobileSnapshot]
@@ -264,6 +267,12 @@ func (c *SessionController) NotifyNetworkChange(networkType string, isMetered bo
 	c.netMu.Lock()
 	c.netPendingType = nt
 	c.netPendingMeter = isMetered
+	if nt == "none" {
+		c.netSawOfflineDuringDebounce = true
+		c.netSameTypeRefreshPending = false
+	} else if c.netHasApplied && c.netLastApplied == nt {
+		c.netSameTypeRefreshPending = true
+	}
 	if c.netDebounceTimer != nil {
 		c.netDebounceTimer.Stop()
 	}
@@ -278,10 +287,20 @@ func (c *SessionController) applyDebouncedNetworkChange() {
 		return
 	}
 	c.netMu.Lock()
+	if c.shuttingDwn.Load() {
+		c.netMu.Unlock()
+		return
+	}
 	nt := c.netPendingType
 	metered := c.netPendingMeter
 	prev := c.netLastApplied
+	wasApplied := c.netHasApplied
+	sawOffline := c.netSawOfflineDuringDebounce
+	sameTypeRefresh := c.netSameTypeRefreshPending
 	c.netLastApplied = nt
+	c.netHasApplied = true
+	c.netSawOfflineDuringDebounce = false
+	c.netSameTypeRefreshPending = false
 	c.netMu.Unlock()
 
 	c.mu.Lock()
@@ -293,7 +312,9 @@ func (c *SessionController) applyDebouncedNetworkChange() {
 	sup := c.activeSup.Load()
 
 	if nt == "none" {
-		c.logs.Append(LogWarn, "[Net] Connectivity lost — entering PAUSED_OFFLINE (0 API calls)")
+		if !wasApplied || prev != "none" {
+			c.logs.Append(LogWarn, "[Net] Connectivity lost — entering PAUSED_OFFLINE (0 API calls)")
+		}
 		if sup != nil {
 			sup.SetPausedOffline(true)
 		}
@@ -301,19 +322,33 @@ func (c *SessionController) applyDebouncedNetworkChange() {
 		return
 	}
 
-	if prev == "none" {
+	needHandover := false
+	switch {
+	case prev == "none":
 		c.logs.Append(LogSuccess, fmt.Sprintf("[Net] Connectivity restored (%s) — resuming tunnels", nt))
+		needHandover = true
+	case sawOffline:
+		c.logs.Append(LogInfo, fmt.Sprintf("[Net] Brief connectivity dropout recovered (%s) — refreshing sockets & underlay", nt))
+		needHandover = true
+	case prev != "" && prev != nt:
+		c.logs.Append(LogInfo, fmt.Sprintf("[Net] Handover %s -> %s — resetting underlay & refreshing sockets", prev, nt))
+		needHandover = true
+	case sameTypeRefresh:
+		c.logs.Append(LogInfo, fmt.Sprintf("[Net] Interface refreshed (%s) — resetting underlay & refreshing sockets", nt))
+		needHandover = true
+	}
+
+	if needHandover {
+		c.apiClient.CloseIdleConnections()
+		c.resolver.CloseIdleConnections()
 		if sup != nil {
 			sup.NotifyHandover()
 		}
-		c.publishSnapshotNow()
-		return
-	}
-
-	if prev != "" && prev != nt {
-		c.logs.Append(LogInfo, fmt.Sprintf("[Net] Handover %s -> %s — resetting underlay & refreshing sockets", prev, nt))
-		if sup != nil {
-			sup.NotifyHandover()
+		c.mu.RLock()
+		stillPaused := c.ctrlState == CtrlPausedOffline
+		c.mu.RUnlock()
+		if stillPaused {
+			c.setCtrlState(CtrlStarting, "network_restored")
 		}
 		c.publishSnapshotNow()
 	}

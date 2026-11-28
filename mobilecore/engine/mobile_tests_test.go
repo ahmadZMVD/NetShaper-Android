@@ -57,6 +57,10 @@ type mockDevTunnelStack struct {
 	authorizedPubs   map[string]bool
 	portExposed      bool
 	observedDestHost []string
+	activeConns      []io.Closer
+	restStatusFn     func(tunnelID string) int
+	rpcFaultFn       func(attempt int) (grpcStatus string, grpcMsg string, rejectMsg string)
+	rpcCalls         atomic.Int32
 	wg               sync.WaitGroup
 }
 
@@ -111,6 +115,20 @@ func startMockDevTunnelStack(t *testing.T, subprotocolMode string, preExposeSSHD
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		reqTunnelID := strings.TrimPrefix(r.URL.Path, "/tunnels/")
+		if idx := strings.IndexByte(reqTunnelID, '/'); idx >= 0 {
+			reqTunnelID = reqTunnelID[:idx]
+		}
+		st.mu.Lock()
+		statusFn := st.restStatusFn
+		st.mu.Unlock()
+		if statusFn != nil {
+			if code := statusFn(reqTunnelID); code != 0 && code != http.StatusOK {
+				w.WriteHeader(code)
+				_, _ = fmt.Fprintf(w, `{"title":"Error %d","status":%d}`, code, code)
+				return
+			}
+		}
 		wsURL := "ws" + strings.TrimPrefix(st.srv.URL, "http") + "/relay"
 		hostPub := st.outerHostPubLine
 		if st.useRawB64HostKey.Load() {
@@ -147,6 +165,9 @@ func startMockDevTunnelStack(t *testing.T, subprotocolMode string, preExposeSSHD
 		}
 		wsConn.SetReadLimit(-1)
 		netConn := websocket.NetConn(r.Context(), wsConn, websocket.MessageBinary)
+		st.mu.Lock()
+		st.activeConns = append(st.activeConns, netConn)
+		st.mu.Unlock()
 		defer netConn.Close()
 
 		if st.subprotocolMode == devTunnelWSProtoV2 {
@@ -160,7 +181,20 @@ func startMockDevTunnelStack(t *testing.T, subprotocolMode string, preExposeSSHD
 	return st
 }
 
+func (st *mockDevTunnelStack) DropAllSessions() {
+	st.mu.Lock()
+	conns := st.activeConns
+	st.activeConns = nil
+	st.mu.Unlock()
+	for _, c := range conns {
+		if c != nil {
+			_ = c.Close()
+		}
+	}
+}
+
 func (st *mockDevTunnelStack) Close() {
+	st.DropAllSessions()
 	st.srv.Close()
 	st.wg.Wait()
 }
@@ -318,6 +352,33 @@ func (st *mockDevTunnelStack) serveH2CGRPC(conn net.Conn) {
 							st.mu.Unlock()
 						}
 					}
+				}
+			}
+			rpcAttempt := int(st.rpcCalls.Add(1))
+			st.mu.Lock()
+			rfn := st.rpcFaultFn
+			st.mu.Unlock()
+			if rfn != nil {
+				gStatus, gMsg, rejMsg := rfn(rpcAttempt)
+				if gStatus != "" {
+					w.Header().Set("Content-Type", "application/grpc")
+					w.Header().Set("Grpc-Status", gStatus)
+					w.Header().Set("Grpc-Message", gMsg)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if rejMsg != "" {
+					var rejPB []byte
+					rejPB = append(rejPB, (1<<3)|0, 0) // Result = false
+					rejPB = append(rejPB, (4<<3)|2)
+					rejPB = encodeProtobufVarint(rejPB, uint64(len(rejMsg)))
+					rejPB = append(rejPB, rejMsg...)
+					w.Header().Set("Content-Type", "application/grpc")
+					w.Header().Set("Trailer", "Grpc-Status, Grpc-Message")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(FrameGRPCMessage(rejPB))
+					w.Header().Set("Grpc-Status", "0")
+					return
 				}
 			}
 			// Encode StartRemoteServerResponse{ Result=true (1), ServerPort="2222" (2, string!), User="codespace" (3) }.
@@ -1940,4 +2001,735 @@ func TestMT21_EmptyTunnelPropertiesFailFastAndNoSilentConnectErrors(t *testing.T
 	}
 	srv.Close()
 	assertGoroutinesClean(t, baseG, 8)
+}
+
+// =============================================================================
+// MT-22: Stale tunnel_id HTTP 404 Auto-Wake + Singleflight + Zero-Clobber Epoch CAS
+// =============================================================================
+func TestMT22_StaleTunnelHTTP404AutoWakeAndZeroClobber(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	stack := startMockDevTunnelStack(t, devTunnelWSProtoV1, true)
+	defer stack.Close()
+
+	var currentTID atomic.Value
+	currentTID.Store("old-tunnel-A")
+	var vmShutdown atomic.Bool
+	var vmStarting atomic.Bool
+	var startCalls atomic.Int32
+	var getCalls atomic.Int32
+	jwt := makeMockJWT(time.Now().Add(2 * time.Hour))
+
+	stack.mu.Lock()
+	stack.restStatusFn = func(tid string) int {
+		if vmShutdown.Load() && tid == "old-tunnel-A" {
+			return http.StatusNotFound
+		}
+		return http.StatusOK
+	}
+	stack.mu.Unlock()
+
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			startCalls.Add(1)
+			vmStarting.Store(true)
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": "mt22-space", "state": "Starting"})
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/user/codespaces/mt22-space"):
+			getCalls.Add(1)
+			state := "Available"
+			if vmShutdown.Load() {
+				if vmStarting.Swap(false) {
+					vmShutdown.Store(false)
+					currentTID.Store("new-tunnel-B")
+					state = "Available"
+				} else {
+					state = "Shutdown"
+				}
+			}
+			tid := currentTID.Load().(string)
+			payload := map[string]any{
+				"name":  "mt22-space",
+				"state": state,
+			}
+			if state == "Available" {
+				payload["connection"] = map[string]any{
+					"tunnelProperties": map[string]any{
+						"connectAccessToken":     stack.connectToken,
+						"managePortsAccessToken": stack.manageToken,
+						"serviceUri":             stack.srv.URL,
+						"tunnelId":               tid,
+						"clusterId":              "euw",
+						"domain":                 "euw.devtunnels.ms",
+					},
+				}
+			}
+			_ = json.NewEncoder(w).Encode(payload)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ghSrv.Close()
+
+	// Part A: Direct Epoch-CAS Zero-Clobber check (delayed worker 2 carrying gen=1 MUST NOT clobber gen=2).
+	var partAGet atomic.Int32
+	var partATID atomic.Value
+	partATID.Store("old-tunnel-A")
+	partASrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		partAGet.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":  "mt22-cas",
+			"state": "Available",
+			"connection": map[string]any{
+				"tunnelProperties": map[string]any{
+					"connectAccessToken": jwt,
+					"serviceUri":         "https://euw.rel.tunnels.api.visualstudio.com",
+					"tunnelId":           partATID.Load().(string),
+					"clusterId":          "euw",
+				},
+			},
+		})
+	}))
+	defer partASrv.Close()
+
+	casCfg := DefaultConfig()
+	casCfg.CodespaceName = "mt22-cas"
+	casCfg.GitHubMinCallSpacing = 0
+	casAPI := NewGitHubAPIClient(partASrv.URL, partASrv.URL, NewAntiPoisonResolver(nil, nil), NewGitHubGuard(casCfg, nil, nil))
+	casCreds := NewCredentialManager(casAPI, "gho_cas", "mt22-cas")
+	casCreds.SetMinInvalidateCooldown(10 * time.Millisecond)
+
+	p1, g1, err := casCreds.GetWithGen(context.Background(), false)
+	if err != nil || p1.TunnelID != "old-tunnel-A" || g1 != 1 {
+		t.Fatalf("MT-22A initial GetWithGen failed: tid=%s gen=%d err=%v", p1.TunnelID, g1, err)
+	}
+	inv1, _ := casCreds.InvalidateIfMatch(g1, "http_404")
+	if !inv1 {
+		t.Fatal("MT-22A expected gen=1 invalidation to succeed")
+	}
+	partATID.Store("new-tunnel-B")
+	p2, g2, err := casCreds.GetWithGen(context.Background(), true)
+	if err != nil || p2.TunnelID != "new-tunnel-B" || g2 != 2 {
+		t.Fatalf("MT-22A refresh GetWithGen failed: tid=%s gen=%d err=%v", p2.TunnelID, g2, err)
+	}
+	// Delayed worker 2 arrives late with stale gen=1!
+	if invLate, coolLate := casCreds.InvalidateIfMatch(g1, "http_404"); invLate || coolLate != 0 {
+		t.Fatalf("MT-22A delayed worker clobbered gen=2! inv=%v cool=%s", invLate, coolLate)
+	}
+	beforeGet := partAGet.Load()
+	pCur, gCur, err := casCreds.GetWithGen(context.Background(), false)
+	if err != nil || pCur.TunnelID != "new-tunnel-B" || gCur != 2 || partAGet.Load() != beforeGet {
+		t.Fatalf("MT-22A expected cached new-tunnel-B gen=2 with 0 API calls, got tid=%s gen=%d callsDelta=%d",
+			pCur.TunnelID, gCur, partAGet.Load()-beforeGet)
+	}
+
+	// Part B: Full Supervisor 2/2 recovery replay of 10.txt / 18.txt HTTP 404 stale tunnel.
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt22-space"
+	cfg.GitHubToken = "gho_mt22_secret"
+	cfg.GitHubAPIBaseURL = ghSrv.URL
+	cfg.LocalPort = 0
+	cfg.PoolSize = 2
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.StopOnExit = false
+	cfg.BackoffMin = 25 * time.Millisecond
+	cfg.BackoffMax = 60 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	res := NewAntiPoisonResolver(nil, nil)
+	guard := NewGitHubGuard(cfg, nil, nil)
+	api := NewGitHubAPIClient(ghSrv.URL, ghSrv.URL, res, guard)
+	api.SetColdPollDelays([]time.Duration{15 * time.Millisecond, 15 * time.Millisecond, 15 * time.Millisecond})
+	creds := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	creds.SetMinInvalidateCooldown(25 * time.Millisecond)
+	hb := NewHeartbeatCoordinator(2 * time.Second)
+	defer hb.Close()
+	tr := NewDevTunnelSSHTransport(cfg, creds, res, hb, nil)
+
+	sup := NewSupervisor(cfg, nil, SupervisorDeps{
+		Transport:   tr,
+		GitHubGuard: guard,
+		PoolHooks:   PoolHooks{SampleDelay: 5 * time.Millisecond, RetryDelay: 10 * time.Millisecond},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	waitUntilCond(t, 5*time.Second, "MT-22 initial 2/2 healthy on old-tunnel-A", func() bool {
+		return sup.State() == StateHealthy && sup.AtomicPoolSnapshot().HealthyWorkers == 2
+	})
+
+	// Simulate Windows shutting down the Codespace while Android is connected.
+	getCalls.Store(0)
+	startCalls.Store(0)
+	vmShutdown.Store(true)
+	stack.DropAllSessions()
+
+	waitUntilCond(t, 6*time.Second, "MT-22 auto-wake recovery to 2/2 healthy on new-tunnel-B", func() bool {
+		return currentTID.Load().(string) == "new-tunnel-B" &&
+			sup.State() == StateHealthy &&
+			sup.AtomicPoolSnapshot().HealthyWorkers == 2
+	})
+
+	if startCalls.Load() != 1 {
+		cancel()
+		<-done
+		t.Fatalf("MT-22 expected exactly 1 singleflight POST /start during dual-worker 404 storm, got %d", startCalls.Load())
+	}
+	if gs := guard.CachedSnapshot(); gs.CallsLast5Min > 6 {
+		cancel()
+		<-done
+		t.Fatalf("MT-22 WAF 5m budget exceeded: %d > 6", gs.CallsLast5Min)
+	}
+	if err := performSOCKS5DomainEcho(sup.AtomicBoundLocalAddr(), "recovered-mt22.example.com", 443, []byte("mt22-ok"), 3*time.Second); err != nil {
+		cancel()
+		<-done
+		t.Fatalf("MT-22 post-recovery SOCKS5 echo failed: %v", err)
+	}
+
+	cancel()
+	<-done
+	hb.Close()
+	stack.Close()
+	ghSrv.Close()
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+// =============================================================================
+// MT-23: Dead-VM StartRemoteServerAsync Rejected + Consecutive Deadline Exceeded + WAN Negative Guard
+// =============================================================================
+func TestMT23_DeadVMRPCRejectionAndConsecutiveDeadlineInvalidation(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	stack := startMockDevTunnelStack(t, devTunnelWSProtoV1, true)
+	defer stack.Close()
+
+	var currentTID atomic.Value
+	currentTID.Store("rpc-dead-A")
+	var ghGetCalls atomic.Int32
+
+	stack.mu.Lock()
+	stack.rpcFaultFn = func(_ int) (string, string, string) {
+		switch currentTID.Load().(string) {
+		case "rpc-dead-A":
+			return "", "", "Please check if an SSH server is installed in the container."
+		case "rpc-zombie-C":
+			return "4", "Deadline Exceeded", ""
+		default:
+			return "", "", ""
+		}
+	}
+	stack.mu.Unlock()
+
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ghGetCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":  "mt23-space",
+			"state": "Available",
+			"connection": map[string]any{
+				"tunnelProperties": map[string]any{
+					"connectAccessToken":     stack.connectToken,
+					"managePortsAccessToken": stack.manageToken,
+					"serviceUri":             stack.srv.URL,
+					"tunnelId":               currentTID.Load().(string),
+					"clusterId":              "euw",
+					"domain":                 "euw.devtunnels.ms",
+				},
+			},
+		})
+	}))
+	defer ghSrv.Close()
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt23-space"
+	cfg.GitHubToken = "gho_mt23"
+	cfg.GitHubMinCallSpacing = 0
+
+	res := NewAntiPoisonResolver(nil, nil)
+	guard := NewGitHubGuard(cfg, nil, nil)
+	api := NewGitHubAPIClient(ghSrv.URL, ghSrv.URL, res, guard)
+	creds := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	creds.SetMinInvalidateCooldown(0)
+	tr := NewDevTunnelSSHTransport(cfg, creds, res, nil, nil)
+
+	// Part A: StartRemoteServerAsync rejected -> invalidates gen=1 immediately -> next Connect refreshes to rpc-fresh-B.
+	if _, err := tr.Connect(context.Background(), "tunnel-1"); err == nil || !strings.Contains(err.Error(), "StartRemoteServerAsync rejected") {
+		t.Fatalf("MT-23A expected StartRemoteServerAsync rejected, got: %v", err)
+	}
+	currentTID.Store("rpc-fresh-B")
+	sessB, err := tr.Connect(context.Background(), "tunnel-1")
+	if err != nil {
+		t.Fatalf("MT-23A expected recovery on rpc-fresh-B, got: %v", err)
+	}
+	_ = sessB.Close()
+
+	// Part B: Consecutive grpc status 4: Deadline Exceeded -> 1st failure does NOT invalidate; 2nd DOES invalidate.
+	creds2 := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	creds2.SetMinInvalidateCooldown(0)
+	tr2 := NewDevTunnelSSHTransport(cfg, creds2, res, nil, nil)
+	currentTID.Store("rpc-zombie-C")
+	ghBefore := ghGetCalls.Load()
+
+	if _, err := tr2.Connect(context.Background(), "tunnel-1"); err == nil || !strings.Contains(err.Error(), "grpc status 4") {
+		t.Fatalf("MT-23B attempt 1 expected grpc status 4, got: %v", err)
+	}
+	if _, gAfter1, _ := creds2.GetWithGen(context.Background(), false); gAfter1 != 1 || ghGetCalls.Load() != ghBefore+1 {
+		t.Fatalf("MT-23B expected gen=1 preserved after single Deadline Exceeded, got gen=%d calls=%d", gAfter1, ghGetCalls.Load()-ghBefore)
+	}
+
+	if _, err := tr2.Connect(context.Background(), "tunnel-2"); err == nil || !strings.Contains(err.Error(), "grpc status 4") {
+		t.Fatalf("MT-23B attempt 2 expected grpc status 4, got: %v", err)
+	}
+	currentTID.Store("rpc-fresh-D")
+	sessD, err := tr2.Connect(context.Background(), "tunnel-1")
+	if err != nil {
+		t.Fatalf("MT-23B expected recovery after 2nd consecutive Deadline Exceeded, got: %v", err)
+	}
+	_ = sessD.Close()
+	if _, gFinal, _ := creds2.GetWithGen(context.Background(), false); gFinal != 2 {
+		t.Fatalf("MT-23B expected credential generation advanced to 2, got %d", gFinal)
+	}
+
+	// Part C (Negative Guard): Local WAN connection-refused / dial errors NEVER invalidate credentials!
+	deadPortLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	deadAddr := deadPortLn.Addr().String()
+	_ = deadPortLn.Close()
+	ghDeadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ghGetCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":  "mt23-wan",
+			"state": "Available",
+			"connection": map[string]any{
+				"tunnelProperties": map[string]any{
+					"connectAccessToken": stack.connectToken,
+					"serviceUri":         "http://" + deadAddr,
+					"tunnelId":           "wan-only-tun",
+					"clusterId":          "euw",
+				},
+			},
+		})
+	}))
+	defer ghDeadSrv.Close()
+	apiDead := NewGitHubAPIClient(ghDeadSrv.URL, ghDeadSrv.URL, res, NewGitHubGuard(cfg, nil, nil))
+	credsWAN := NewCredentialManager(apiDead, cfg.GitHubToken, "mt23-wan")
+	credsWAN.SetMinInvalidateCooldown(0)
+	trWAN := NewDevTunnelSSHTransport(cfg, credsWAN, res, nil, nil)
+
+	callsBeforeWAN := ghGetCalls.Load()
+	for i := 0; i < 3; i++ {
+		if _, err := trWAN.Connect(context.Background(), "tunnel-1"); err == nil {
+			t.Fatal("MT-23C expected local WAN dial failure")
+		}
+	}
+	if delta := ghGetCalls.Load() - callsBeforeWAN; delta != 1 {
+		t.Fatalf("MT-23C local WAN error caused %d GitHub API calls (want strictly 1 initial fetch, 0 invalidations)", delta)
+	}
+
+	stack.Close()
+	ghSrv.Close()
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+// =============================================================================
+// MT-24: Iranian CSFB Phone Call (Brief Dropout + Same-Type Refresh + Hung Boot Abort + Broadcast Wake)
+// =============================================================================
+func TestMT24_PhoneCallCSFBAndBriefDropoutHandoverRecovery(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+
+	// Part A & B: Brief <150ms dropout inside debounce window AND same-type "cellular"->"cellular" refresh.
+	tr := &mockTransport{}
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt24-csfb"
+	cfg.LocalPort = 0
+	cfg.PoolSize = 2
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.StopOnExit = false
+	cfg.NetworkDebounceInterval = 90 * time.Millisecond
+	cfg.BackoffMin = 20 * time.Millisecond
+	cfg.BackoffMax = 40 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	ctrl := NewSessionController(cfg, ControllerCallbacks{}, ControllerOverrides{
+		TransportFactory: func(_ Config, _ *CredentialManager, _ *AntiPoisonResolver, _ *HeartbeatCoordinator, _ *EventLogger) WorkerTransport {
+			return tr
+		},
+		PoolHooks: PoolHooks{
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 110 * time.Millisecond, nil
+			},
+		},
+		SnapshotInterval: 40 * time.Millisecond,
+	})
+	ctrl.Start()
+
+	ctrl.NotifyNetworkChange("cellular", true)
+	waitUntilCond(t, 4*time.Second, "MT-24 initial 2/2 on cellular", func() bool {
+		s := ctrl.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2 && s.NetworkType == "cellular"
+	})
+	if got := tr.connects.Load(); got != 2 {
+		ctrl.StopAndWait(4 * time.Second)
+		t.Fatalf("MT-24 initial NotifyNetworkChange must NOT trigger spurious handover reconnect: connects=%d", got)
+	}
+
+	// Part A: Brief dropout "none" -> 30ms -> "cellular" coalesced inside 90ms debounce!
+	beforeA := tr.connects.Load()
+	ctrl.NotifyNetworkChange("none", false)
+	time.Sleep(30 * time.Millisecond)
+	ctrl.NotifyNetworkChange("cellular", true)
+	waitUntilCond(t, 3*time.Second, "MT-24A both workers reconnect after brief dropout", func() bool {
+		s := ctrl.Snapshot()
+		return tr.connects.Load() >= beforeA+2 && s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+
+	// Part B: Same-type interface refresh ("cellular" -> "cellular" from Android networkHandle/IP swap).
+	beforeB := tr.connects.Load()
+	ctrl.NotifyNetworkChange("cellular", true)
+	waitUntilCond(t, 3*time.Second, "MT-24B both workers reconnect on same-type CSFB cellular refresh", func() bool {
+		s := ctrl.Snapshot()
+		return tr.connects.Load() >= beforeB+2 && s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+	if ctrl.Guard().CachedSnapshot().CallsLast5Min != 0 {
+		ctrl.StopAndWait(4 * time.Second)
+		t.Fatalf("MT-24A/B handovers must consume 0 GitHub API calls, got %d", ctrl.Guard().CachedSnapshot().CallsLast5Min)
+	}
+	ctrl.StopAndWait(4 * time.Second)
+
+	// Part C: Hung 60s boot abort (<500ms) on tunnel-1 + 15s backoff broadcast wake on tunnel-2.
+	var phase atomic.Int32 // 0=initial ok, 1=tunnel-1 hangs & tunnel-2 fails into 15s backoff, 2=wifi handover ok
+	hungEntered := make(chan struct{}, 4)
+	t2FailedOnce := make(chan struct{}, 4)
+	var t1Once, t2Once sync.Once
+
+	trC := &mockTransport{
+		onConn: func(workerID string, seq int64) (*mockWorkerSession, error) {
+			if phase.Load() == 1 {
+				if workerID == "tunnel-1" {
+					t1Once.Do(func() { close(hungEntered) })
+					return nil, errors.New("unreachable")
+				}
+				t2Once.Do(func() { close(t2FailedOnce) })
+				return nil, errors.New("simulated cellular drop into backoff")
+			}
+			return newMockWorkerSession("20.93.53.155:443"), nil
+		},
+	}
+	// Wrap mockTransport so tunnel-1 blocks on ctx.Done() in phase 1!
+	hungTr := &ctxAwareFuncTransport{
+		fn: func(ctx context.Context, workerID string) (WorkerSession, error) {
+			if phase.Load() == 1 && workerID == "tunnel-1" {
+				t1Once.Do(func() { close(hungEntered) })
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return trC.Connect(ctx, workerID)
+		},
+	}
+
+	cfgC := DefaultConfig()
+	cfgC.CodespaceName = "mt24-hung"
+	cfgC.LocalPort = 0
+	cfgC.PoolSize = 2
+	cfgC.BootQualitySamples = 1
+	cfgC.BootMicroPayloadCheck = false
+	cfgC.StopOnExit = false
+	cfgC.NetworkDebounceInterval = 60 * time.Millisecond
+	cfgC.BackoffMin = 15 * time.Second
+	cfgC.BackoffMax = 30 * time.Second
+	cfgC.GitHubMinCallSpacing = 0
+
+	ctrlC := NewSessionController(cfgC, ControllerCallbacks{}, ControllerOverrides{
+		TransportFactory: func(_ Config, _ *CredentialManager, _ *AntiPoisonResolver, _ *HeartbeatCoordinator, _ *EventLogger) WorkerTransport {
+			return hungTr
+		},
+		PoolHooks: PoolHooks{
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 95 * time.Millisecond, nil
+			},
+		},
+		SnapshotInterval: 30 * time.Millisecond,
+	})
+	ctrlC.NotifyNetworkChange("cellular", true)
+	ctrlC.Start()
+	defer ctrlC.StopAndWait(4 * time.Second)
+
+	waitUntilCond(t, 4*time.Second, "MT-24C initial 2/2 healthy", func() bool {
+		s := ctrlC.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2 && s.NetworkType == "cellular"
+	})
+
+	// Trigger phase 1 via CSFB cellular glitch handover: tunnel-1 hangs in dial, tunnel-2 fails and sleeps in 15s backoff.
+	phase.Store(1)
+	ctrlC.NotifyNetworkChange("cellular", true)
+	select {
+	case <-hungEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("MT-24C tunnel-1 did not enter hung Connect")
+	}
+	select {
+	case <-t2FailedOnce:
+	case <-time.After(3 * time.Second):
+		t.Fatal("MT-24C tunnel-2 did not fail into 15s backoff")
+	}
+	time.Sleep(80 * time.Millisecond) // Ensure tunnel-2 is asleep inside 15s backoff timer.
+
+	// Trigger handover to Wi-Fi! Both hung tunnel-1 AND 15s-sleeping tunnel-2 MUST recover in <2.5s!
+	tHandover := time.Now()
+	phase.Store(2)
+	ctrlC.NotifyNetworkChange("wifi", false)
+	waitUntilCond(t, 2500*time.Millisecond, "MT-24C BOTH hung boot + 15s backoff wake and recover to 2/2", func() bool {
+		s := ctrlC.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2 && s.NetworkType == "wifi"
+	})
+	if elapsed := time.Since(tHandover); elapsed > 2500*time.Millisecond {
+		t.Fatalf("MT-24C recovery took %s (>2.5s)", elapsed)
+	}
+
+	ctrlC.StopAndWait(4 * time.Second)
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+type ctxAwareFuncTransport struct {
+	fn func(ctx context.Context, workerID string) (WorkerSession, error)
+}
+
+func (f *ctxAwareFuncTransport) Connect(ctx context.Context, workerID string) (WorkerSession, error) {
+	return f.fn(ctx, workerID)
+}
+
+// =============================================================================
+// MT-25: Persistent 404 WAF Budget Protection & Exponential Same-Tunnel Cooldown
+// =============================================================================
+func TestMT25_Persistent404WAFBudgetProtectionAndSameTunnelBackoff(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+	stack := startMockDevTunnelStack(t, devTunnelWSProtoV1, true)
+	defer stack.Close()
+
+	var azureOutage atomic.Bool
+	azureOutage.Store(true)
+	var devTunnel404Hits atomic.Int32
+	var ghCalls atomic.Int32
+
+	stack.mu.Lock()
+	stack.restStatusFn = func(tid string) int {
+		if azureOutage.Load() {
+			devTunnel404Hits.Add(1)
+			return http.StatusNotFound
+		}
+		return http.StatusOK
+	}
+	stack.mu.Unlock()
+
+	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ghCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":  "mt25-space",
+			"state": "Available",
+			"connection": map[string]any{
+				"tunnelProperties": map[string]any{
+					"connectAccessToken":     stack.connectToken,
+					"managePortsAccessToken": stack.manageToken,
+					"serviceUri":             stack.srv.URL,
+					"tunnelId":               "stuck-same-id",
+					"clusterId":              "euw",
+					"domain":                 "euw.devtunnels.ms",
+				},
+			},
+		})
+	}))
+	defer ghSrv.Close()
+
+	cfg := DefaultConfig()
+	cfg.CodespaceName = "mt25-space"
+	cfg.GitHubToken = "gho_mt25"
+	cfg.GitHubAPIBaseURL = ghSrv.URL
+	cfg.LocalPort = 0
+	cfg.PoolSize = 2
+	cfg.BootQualitySamples = 1
+	cfg.BootMicroPayloadCheck = false
+	cfg.StopOnExit = false
+	cfg.BackoffMin = 15 * time.Millisecond
+	cfg.BackoffMax = 25 * time.Millisecond
+	cfg.GitHubMinCallSpacing = 0
+
+	res := NewAntiPoisonResolver(nil, nil)
+	guard := NewGitHubGuard(cfg, nil, nil)
+	api := NewGitHubAPIClient(ghSrv.URL, ghSrv.URL, res, guard)
+	creds := NewCredentialManager(api, cfg.GitHubToken, cfg.CodespaceName)
+	creds.SetMinInvalidateCooldown(180 * time.Millisecond)
+	tr := NewDevTunnelSSHTransport(cfg, creds, res, nil, nil)
+
+	sup := NewSupervisor(cfg, nil, SupervisorDeps{
+		Transport:   tr,
+		GitHubGuard: guard,
+		PoolHooks:   PoolHooks{SampleDelay: 5 * time.Millisecond, RetryDelay: 10 * time.Millisecond},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- sup.Run(ctx) }()
+
+	// Wait through >= 12 persistent 404 failures; same-tunnel backoff MUST keep GitHub calls <= 5!
+	waitUntilCond(t, 5*time.Second, "MT-25 >= 12 DevTunnels 404 errors observed", func() bool {
+		return devTunnel404Hits.Load() >= 12
+	})
+	gs := guard.CachedSnapshot()
+	if gs.CallsLast5Min > 6 || gs.CooldownRemainingMS != 0 {
+		cancel()
+		<-done
+		t.Fatalf("MT-25 WAF budget violated or hit cooldown during persistent 404: 5m=%d cooldown=%d", gs.CallsLast5Min, gs.CooldownRemainingMS)
+	}
+	if ghCalls.Load() >= devTunnel404Hits.Load() {
+		cancel()
+		<-done
+		t.Fatalf("MT-25 expected same-tunnel cooldown to throttle GitHub calls (%d) well below 404 hits (%d)", ghCalls.Load(), devTunnel404Hits.Load())
+	}
+
+	// Recover Azure DevTunnels -> pool reaches 2/2 HEALTHY and resets sameTunnelInvalidateStreak via MarkTunnelHealthy.
+	azureOutage.Store(false)
+	waitUntilCond(t, 5*time.Second, "MT-25 recovers to 2/2 healthy once Azure 404 clears", func() bool {
+		return sup.State() == StateHealthy && sup.AtomicPoolSnapshot().HealthyWorkers == 2
+	})
+
+	_, gen, gerr := creds.GetWithGen(context.Background(), false)
+	if gerr != nil || gen == 0 {
+		cancel()
+		<-done
+		t.Fatalf("MT-25 GetWithGen post-recovery failed: gen=%d err=%v", gen, gerr)
+	}
+	if invNow, remNow := creds.InvalidateIfMatch(gen, "http_404"); !invNow || remNow != 0 {
+		cancel()
+		<-done
+		t.Fatalf("MT-25 MarkTunnelHealthy did not clear cooldown streak: inv=%v rem=%s", invNow, remNow)
+	}
+
+	cancel()
+	<-done
+	stack.Close()
+	ghSrv.Close()
+	assertGoroutinesClean(t, baseG, 10)
+}
+
+// =============================================================================
+// MT-26: Zero Duplicate WORKER_BOOT_FAIL Logs + Immediate CtrlPausedOffline Exit
+// =============================================================================
+func TestMT26_ZeroDuplicateWorkerBootFailLogsAndCleanOfflineExit(t *testing.T) {
+	baseG := runtime.NumGoroutine()
+
+	// Part A: Force 3 consecutive boot failures on tunnel-1 -> MUST emit EXACTLY 3 WORKER_BOOT_FAIL lines (not 6!).
+	var attemptsA atomic.Int32
+	trA := &ctxAwareFuncTransport{
+		fn: func(_ context.Context, _ string) (WorkerSession, error) {
+			if attemptsA.Add(1) <= 3 {
+				return nil, errors.New("simulated dial fail")
+			}
+			return newMockWorkerSession("20.93.53.155:443"), nil
+		},
+	}
+	cfgA := DefaultConfig()
+	cfgA.CodespaceName = "mt26-logs"
+	cfgA.LocalPort = 0
+	cfgA.PoolSize = 1
+	cfgA.BootQualitySamples = 1
+	cfgA.BootMicroPayloadCheck = false
+	cfgA.StopOnExit = false
+	cfgA.BackoffMin = 15 * time.Millisecond
+	cfgA.BackoffMax = 25 * time.Millisecond
+	cfgA.GitHubMinCallSpacing = 0
+
+	ctrlA := NewSessionController(cfgA, ControllerCallbacks{}, ControllerOverrides{
+		TransportFactory: func(_ Config, _ *CredentialManager, _ *AntiPoisonResolver, _ *HeartbeatCoordinator, _ *EventLogger) WorkerTransport {
+			return trA
+		},
+		PoolHooks: PoolHooks{
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 90 * time.Millisecond, nil
+			},
+		},
+		SnapshotInterval: 40 * time.Millisecond,
+	})
+	ctrlA.Start()
+	waitUntilCond(t, 4*time.Second, "MT-26A reaches RUNNING after 3 failed boots", func() bool {
+		return ctrlA.Snapshot().State == CtrlRunning && ctrlA.Snapshot().HealthyWorkers == 1
+	})
+	ctrlA.StopAndWait(4 * time.Second)
+
+	failLogCount := 0
+	for _, ln := range ctrlA.Logs().Since(0) {
+		if strings.Contains(ln.Text, "[Boot] tunnel-1 failed:") {
+			failLogCount++
+		}
+	}
+	if failLogCount != 3 {
+		t.Fatalf("MT-26A expected EXACTLY 3 [Boot] tunnel-1 failed: lines (zero duplicates), got %d", failLogCount)
+	}
+
+	// Part B: Verify immediate exit out of CtrlPausedOffline before workers even finish booting.
+	var gateActive atomic.Bool
+	restoreGate := make(chan struct{})
+	trB := &ctxAwareFuncTransport{
+		fn: func(ctx context.Context, _ string) (WorkerSession, error) {
+			if gateActive.Load() {
+				select {
+				case <-restoreGate:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			return newMockWorkerSession("20.93.53.155:443"), nil
+		},
+	}
+	cfgB := DefaultConfig()
+	cfgB.CodespaceName = "mt26-offline"
+	cfgB.LocalPort = 0
+	cfgB.PoolSize = 2
+	cfgB.BootQualitySamples = 1
+	cfgB.BootMicroPayloadCheck = false
+	cfgB.StopOnExit = false
+	cfgB.NetworkDebounceInterval = 60 * time.Millisecond
+	cfgB.BackoffMin = 20 * time.Millisecond
+	cfgB.BackoffMax = 40 * time.Millisecond
+	cfgB.GitHubMinCallSpacing = 0
+
+	ctrlB := NewSessionController(cfgB, ControllerCallbacks{}, ControllerOverrides{
+		TransportFactory: func(_ Config, _ *CredentialManager, _ *AntiPoisonResolver, _ *HeartbeatCoordinator, _ *EventLogger) WorkerTransport {
+			return trB
+		},
+		PoolHooks: PoolHooks{
+			ProbeFunc: func(_ context.Context, _ WorkerSession, _ string, _ time.Duration) (time.Duration, error) {
+				return 95 * time.Millisecond, nil
+			},
+		},
+		SnapshotInterval: 30 * time.Millisecond,
+	})
+	ctrlB.Start()
+	defer ctrlB.StopAndWait(4 * time.Second)
+
+	waitUntilCond(t, 4*time.Second, "MT-26B initial 2/2 running", func() bool {
+		s := ctrlB.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+
+	ctrlB.NotifyNetworkChange("none", false)
+	waitUntilCond(t, 2*time.Second, "MT-26B enters PAUSED_OFFLINE", func() bool {
+		return ctrlB.Snapshot().State == CtrlPausedOffline
+	})
+
+	gateActive.Store(true)
+	ctrlB.NotifyNetworkChange("wifi", false)
+	waitUntilCond(t, 1*time.Second, "MT-26B exits PAUSED_OFFLINE immediately while workers still booting", func() bool {
+		return ctrlB.Snapshot().State != CtrlPausedOffline
+	})
+
+	close(restoreGate)
+	waitUntilCond(t, 4*time.Second, "MT-26B recovers fully to CtrlRunning 2/2", func() bool {
+		s := ctrlB.Snapshot()
+		return s.State == CtrlRunning && s.HealthyWorkers == 2
+	})
+
+	ctrlB.StopAndWait(4 * time.Second)
+	assertGoroutinesClean(t, baseG, 10)
 }

@@ -107,7 +107,8 @@ type TunnelPool struct {
 	pausedOffline     atomic.Bool
 	offlineMu         sync.Mutex
 	offlineWakeCh     chan struct{}
-	resumeOffline     chan struct{}
+	wakeMu            sync.Mutex
+	wakeBackoffCh     chan struct{}
 	proactiveProbeChs map[string]chan struct{}
 	healthChangedCh   chan struct{}
 	coordWakeCh       chan struct{}
@@ -146,6 +147,7 @@ func NewTunnelPool(cfg Config, transport WorkerTransport, logger *EventLogger, m
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("tunnel-%d", i+1)
 		w := NewTunnelInstance(id, cfg, transport, hooks.ProbeFunc, hooks.MicroPayloadProbeFunc, logger, metrics, guard)
+		w.managedByPool.Store(true)
 		if hooks.SampleDelay > 0 {
 			w.sampleDel = hooks.SampleDelay
 		}
@@ -188,7 +190,7 @@ func NewTunnelPool(cfg Config, transport WorkerTransport, logger *EventLogger, m
 		unparkBroadcastCh: make(chan struct{}),
 		parkCh:            make(chan bool, 4),
 		offlineWakeCh:     make(chan struct{}),
-		resumeOffline:     make(chan struct{}, 4),
+		wakeBackoffCh:     make(chan struct{}),
 		proactiveProbeChs: proactiveChs,
 		healthChangedCh:   make(chan struct{}, 1),
 		coordWakeCh:       make(chan struct{}, 1),
@@ -369,12 +371,26 @@ func (p *TunnelPool) signalPark(park bool) {
 	}
 }
 
+func (p *TunnelPool) currentWakeBackoffCh() <-chan struct{} {
+	p.wakeMu.Lock()
+	ch := p.wakeBackoffCh
+	p.wakeMu.Unlock()
+	return ch
+}
+
+func (p *TunnelPool) broadcastWakeBackoff() {
+	p.wakeMu.Lock()
+	close(p.wakeBackoffCh)
+	p.wakeBackoffCh = make(chan struct{})
+	p.wakeMu.Unlock()
+}
+
 // SetPausedOffline pauses all worker reconnects (0 API calls) while phone has no network,
 // or resumes cleanly and fast-probes existing sessions when connectivity returns.
 func (p *TunnelPool) SetPausedOffline(offline bool) {
 	prev := p.pausedOffline.Swap(offline)
 	if offline {
-		// Drop dead sockets immediately so stale interface descriptors don't linger.
+		// Drop dead sockets and abort hung in-flight boots immediately so stale interface descriptors don't linger.
 		for _, w := range p.workers {
 			w.TriggerEviction("paused_offline")
 		}
@@ -388,24 +404,27 @@ func (p *TunnelPool) SetPausedOffline(offline bool) {
 		close(p.offlineWakeCh)
 		p.offlineWakeCh = make(chan struct{})
 		p.offlineMu.Unlock()
+		p.broadcastWakeBackoff()
 		p.signalCoordWake()
-		select {
-		case p.resumeOffline <- struct{}{}:
-		default:
-		}
 		p.publishSnapshot()
 	}
 }
 
-// ForceReconnectForHandover resets underlay baseline and triggers immediate fast-probe / reconnect
-// of workers bound to a stale network interface without burning extra GitHub API calls (reuses cached JWT).
+// ForceReconnectForHandover resets underlay baseline, aborts any hung boot dials, and wakes all
+// backoff-sleeping workers immediately without burning extra GitHub API calls (reuses cached JWT).
 func (p *TunnelPool) ForceReconnectForHandover() {
 	p.ResetUnderlayBaseline()
+	if ic, ok := p.transport.(interface{ CloseIdleConnections() }); ok {
+		ic.CloseIdleConnections()
+	}
 	for _, w := range p.workers {
-		if w.State() == TunnelHealthy || w.State() == TunnelDegraded {
+		st := w.State()
+		if st == TunnelHealthy || st == TunnelDegraded || st == TunnelStarting {
 			w.TriggerEviction("network_handover")
 		}
 	}
+	p.broadcastWakeBackoff()
+	p.signalCoordWake()
 	p.publishSnapshot()
 }
 
@@ -1313,6 +1332,10 @@ func (p *TunnelPool) superviseWorker(ctx context.Context, idx int, w *TunnelInst
 
 		sess, _, err := w.BootAndQualify(ctx, p.PeerFastMedianMS, p.UnderlayBaselineMS)
 		if err != nil {
+			if errors.Is(err, ErrBootAbortedForHandover) {
+				attempt = 0
+				continue
+			}
 			var fatalErr *FatalBootError
 			if errors.As(err, &fatalErr) {
 				w.DrainAndClose(100*time.Millisecond, TunnelDead)
@@ -1325,6 +1348,7 @@ func (p *TunnelPool) superviseWorker(ctx context.Context, idx int, w *TunnelInst
 				return
 			}
 			if p.pausedOffline.Load() {
+				attempt = 0
 				continue
 			}
 			attempt++
@@ -1334,16 +1358,23 @@ func (p *TunnelPool) superviseWorker(ctx context.Context, idx int, w *TunnelInst
 					"tunnel_id":  w.id,
 					"attempt":    attempt,
 					"backoff_ms": backoff.Milliseconds(),
+					"elapsed_ms": w.LastBootElapsedMS(),
 					"error":      RedactSecrets(err.Error()),
 				})
+			}
+			wakeCh := p.currentWakeBackoffCh()
+			if p.pausedOffline.Load() {
+				attempt = 0
+				continue
 			}
 			tm := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
 				tm.Stop()
 				return
-			case <-p.resumeOffline:
+			case <-wakeCh:
 				tm.Stop()
+				attempt = 0
 			case <-tm.C:
 			}
 			continue
@@ -1402,17 +1433,20 @@ func (p *TunnelPool) superviseWorker(ctx context.Context, idx int, w *TunnelInst
 
 		if reason == "network_handover" {
 			// Fast handover reconnect without exponential sleep penalty.
+			attempt = 0
 			continue
 		}
 		attempt++
 		backoff := ComputeBackoff(attempt, p.cfg.BackoffMin, p.cfg.BackoffMax, nil)
+		wakeCh := p.currentWakeBackoffCh()
 		tm := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
 			tm.Stop()
 			return
-		case <-p.resumeOffline:
+		case <-wakeCh:
 			tm.Stop()
+			attempt = 0
 		case <-tm.C:
 		}
 	}

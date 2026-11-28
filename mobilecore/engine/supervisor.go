@@ -217,6 +217,9 @@ func (s *Supervisor) SetPausedOffline(offline bool) {
 
 func (s *Supervisor) NotifyHandover() {
 	s.pausedOffline.Store(false)
+	if s.State() == StatePausedOffline {
+		s.setState(StateProbing)
+	}
 	if pool := s.activePoolPtr.Load(); pool != nil {
 		pool.SetPausedOffline(false)
 		pool.ForceReconnectForHandover()

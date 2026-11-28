@@ -550,8 +550,14 @@ func (c *GitHubAPIClient) EnsureAvailableAndFetchTunnel(ctx context.Context, tok
 		return waitAndRecheckMissingProps(detail)
 	}
 
-	lowState := strings.ToLower(strings.TrimSpace(detail.State))
-	if lowState == "shutdown" || lowState == "stopped" || lowState == "unavailable" {
+	isStoppableVMState := func(st string) bool {
+		low := strings.ToLower(strings.TrimSpace(st))
+		return low == "shutdown" || low == "stopped" || low == "unavailable"
+	}
+
+	startIssued := false
+	if isStoppableVMState(detail.State) {
+		startIssued = true
 		startDetail, serr := c.StartCodespace(ctx, token, name)
 		if serr != nil {
 			return CodespaceDetail{}, serr
@@ -578,6 +584,17 @@ func (c *GitHubAPIClient) EnsureAvailableAndFetchTunnel(ctx context.Context, tok
 				return detail, nil
 			}
 			return waitAndRecheckMissingProps(detail)
+		}
+		// If the initial GET caught the VM mid-"ShuttingDown", issue POST /start once it settles to Shutdown.
+		if !startIssued && isStoppableVMState(detail.State) {
+			startIssued = true
+			startDetail, serr := c.StartCodespace(ctx, token, name)
+			if serr != nil {
+				return CodespaceDetail{}, serr
+			}
+			if strings.EqualFold(startDetail.State, "Available") && hasCompleteTunnelProperties(startDetail) {
+				return startDetail, nil
+			}
 		}
 	}
 	return CodespaceDetail{}, fmt.Errorf("codespace %q did not reach Available state (last=%q %s)", name, detail.State, detail.RawDiagnosticKeys)
@@ -780,36 +797,74 @@ func parseBillingUsageJSON(raw []byte) (float64, float64, bool) {
 }
 
 // CredentialManager shares one fresh Dev Tunnels TunnelProperties JWT across all pool workers
-// using strict singleflight refresh and local zero-API JWT `exp` validation.
+// using strict singleflight refresh, epoch-guarded invalidation, same-tunnel WAF cooldown, and
+// local zero-API JWT `exp` validation.
 type CredentialManager struct {
-	api           *GitHubAPIClient
-	token         string
-	codespaceName string
-	refreshMargin time.Duration
-	nowFn         func() time.Time
+	api                 *GitHubAPIClient
+	token               string
+	codespaceName       string
+	refreshMargin       time.Duration
+	minInvalidateCooldown time.Duration
+	nowFn               func() time.Time
 
-	mu        sync.Mutex
-	logger    *EventLogger
-	cached    TunnelProperties
-	expiresAt time.Time
-	hasCached bool
-	inFlight  *credFlight
+	mu                         sync.Mutex
+	logger                     *EventLogger
+	gen                        uint64
+	cached                     TunnelProperties
+	expiresAt                  time.Time
+	lastRefreshAt              time.Time
+	lastInvalidatedTunnelID    string
+	sameTunnelInvalidateStreak int
+	nextInvalidateAllowedAt    time.Time
+	hasCached                  bool
+	inFlight                   *credFlight
 }
 
 type credFlight struct {
 	done chan struct{}
 	res  TunnelProperties
+	gen  uint64
 	err  error
 }
 
 func NewCredentialManager(api *GitHubAPIClient, token, codespaceName string) *CredentialManager {
 	return &CredentialManager{
-		api:           api,
-		token:         strings.TrimSpace(token),
-		codespaceName: strings.TrimSpace(codespaceName),
-		refreshMargin: 10 * time.Minute,
-		nowFn:         time.Now,
+		api:                   api,
+		token:                 strings.TrimSpace(token),
+		codespaceName:         strings.TrimSpace(codespaceName),
+		refreshMargin:         10 * time.Minute,
+		minInvalidateCooldown: 20 * time.Second,
+		nowFn:                 time.Now,
 	}
+}
+
+// SetMinInvalidateCooldown overrides the base cooldown between consecutive invalidations
+// when GitHub returns the same stale tunnel_id (primarily for deterministic fast tests).
+func (m *CredentialManager) SetMinInvalidateCooldown(d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.minInvalidateCooldown = d
+	m.mu.Unlock()
+}
+
+func sameTunnelInvalidateBackoff(streak int, base time.Duration) time.Duration {
+	if base <= 0 {
+		base = 20 * time.Second
+	}
+	if streak <= 1 {
+		return base
+	}
+	shift := streak - 1
+	if shift > 4 {
+		shift = 4
+	}
+	d := base << shift
+	if d > 3*time.Minute {
+		return 3 * time.Minute
+	}
+	return d
 }
 
 // SetLogger binds an optional EventLogger for redacted schema/credential diagnostics.
@@ -822,8 +877,11 @@ func (m *CredentialManager) SetLogger(logger *EventLogger) {
 	m.mu.Unlock()
 }
 
-// Invalidate clears the cached JWT (called when Dev Tunnels relay rejects with HTTP 401/403).
+// Invalidate clears the cached JWT unconditionally (preserved for compatibility).
 func (m *CredentialManager) Invalidate() {
+	if m == nil {
+		return
+	}
 	m.mu.Lock()
 	m.hasCached = false
 	m.expiresAt = time.Time{}
@@ -831,16 +889,104 @@ func (m *CredentialManager) Invalidate() {
 	m.mu.Unlock()
 }
 
+// InvalidateIfMatch clears cached credentials ONLY if staleGen matches the active generation,
+// no refresh is currently in flight, and WAF-protective invalidation cooldown has elapsed.
+// Returns (invalidated, cooldownRemaining).
+func (m *CredentialManager) InvalidateIfMatch(staleGen uint64, reason string) (bool, time.Duration) {
+	if m == nil {
+		return false, 0
+	}
+	m.mu.Lock()
+	now := m.nowFn()
+	base := m.minInvalidateCooldown
+	if base < 0 {
+		base = 0
+	}
+	if m.inFlight != nil {
+		m.mu.Unlock()
+		return false, 0
+	}
+	if !m.hasCached {
+		if !m.nextInvalidateAllowedAt.IsZero() && now.Before(m.nextInvalidateAllowedAt) {
+			rem := m.nextInvalidateAllowedAt.Sub(now)
+			m.mu.Unlock()
+			return false, rem
+		}
+		if base > 0 {
+			m.nextInvalidateAllowedAt = now.Add(base)
+		}
+		m.mu.Unlock()
+		return true, 0
+	}
+	if staleGen == 0 || staleGen != m.gen {
+		// Another worker already refreshed credentials to a newer generation — never clobber!
+		m.mu.Unlock()
+		return false, 0
+	}
+	if !m.nextInvalidateAllowedAt.IsZero() && now.Before(m.nextInvalidateAllowedAt) {
+		urgentAuth := reason == "http_401" || reason == "http_403" || reason == "wss_http_401" || reason == "wss_http_403"
+		if !urgentAuth || base == 0 || now.Sub(m.lastRefreshAt) < base/3 {
+			rem := m.nextInvalidateAllowedAt.Sub(now)
+			m.mu.Unlock()
+			return false, rem
+		}
+	}
+
+	staleTunnelID := m.cached.TunnelID
+	m.lastInvalidatedTunnelID = staleTunnelID
+	m.hasCached = false
+	m.expiresAt = time.Time{}
+	m.cached = TunnelProperties{}
+	if base > 0 {
+		m.nextInvalidateAllowedAt = now.Add(base)
+	}
+	streak := m.sameTunnelInvalidateStreak
+	logger := m.logger
+	m.mu.Unlock()
+
+	if logger != nil {
+		logger.Log("CREDENTIAL_INVALIDATED", map[string]any{
+			"tunnel_id":          staleTunnelID,
+			"reason":             reason,
+			"stale_gen":          staleGen,
+			"same_tunnel_streak": streak,
+		})
+	}
+	return true, 0
+}
+
+// MarkTunnelHealthy clears same-tunnel invalidation backoff streaks once a worker connects cleanly on gen.
+func (m *CredentialManager) MarkTunnelHealthy(gen uint64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if gen == 0 || gen == m.gen {
+		m.sameTunnelInvalidateStreak = 0
+		m.lastInvalidatedTunnelID = ""
+		m.nextInvalidateAllowedAt = time.Time{}
+	}
+	m.mu.Unlock()
+}
+
 // Get returns a valid cached TunnelProperties with 0 API calls, or joins/executes ONE singleflight refresh.
 func (m *CredentialManager) Get(ctx context.Context, forceRefresh bool) (TunnelProperties, error) {
+	p, _, err := m.GetWithGen(ctx, forceRefresh)
+	return p, err
+}
+
+// GetWithGen returns a valid cached TunnelProperties and its credential generation epoch.
+func (m *CredentialManager) GetWithGen(ctx context.Context, forceRefresh bool) (TunnelProperties, uint64, error) {
+	retriedLeaderCancel := false
 	for {
 		m.mu.Lock()
 		now := m.nowFn()
 		logger := m.logger
 		if !forceRefresh && m.hasCached && now.Add(m.refreshMargin).Before(m.expiresAt) {
 			cp := m.cached
+			gen := m.gen
 			m.mu.Unlock()
-			return cp, nil
+			return cp, gen, nil
 		}
 		if m.inFlight != nil {
 			flight := m.inFlight
@@ -848,11 +994,15 @@ func (m *CredentialManager) Get(ctx context.Context, forceRefresh bool) (TunnelP
 			select {
 			case <-flight.done:
 				if flight.err != nil {
-					return TunnelProperties{}, flight.err
+					if errors.Is(flight.err, context.Canceled) && ctx.Err() == nil && !retriedLeaderCancel {
+						retriedLeaderCancel = true
+						continue
+					}
+					return TunnelProperties{}, 0, flight.err
 				}
-				return flight.res, nil
+				return flight.res, flight.gen, nil
 			case <-ctx.Done():
-				return TunnelProperties{}, ctx.Err()
+				return TunnelProperties{}, 0, ctx.Err()
 			}
 		}
 		flight := &credFlight{done: make(chan struct{})}
@@ -882,22 +1032,38 @@ func (m *CredentialManager) Get(ctx context.Context, forceRefresh bool) (TunnelP
 		}
 
 		m.mu.Lock()
+		var outGen uint64
 		if err == nil {
+			doneNow := m.nowFn()
+			m.gen++
+			outGen = m.gen
+			if props.TunnelID != "" && props.TunnelID == m.lastInvalidatedTunnelID {
+				m.sameTunnelInvalidateStreak++
+				if m.minInvalidateCooldown > 0 {
+					m.nextInvalidateAllowedAt = doneNow.Add(sameTunnelInvalidateBackoff(m.sameTunnelInvalidateStreak, m.minInvalidateCooldown))
+				}
+			} else {
+				m.sameTunnelInvalidateStreak = 0
+				m.lastInvalidatedTunnelID = ""
+				m.nextInvalidateAllowedAt = time.Time{}
+			}
 			m.cached = props
 			m.hasCached = true
+			m.lastRefreshAt = doneNow
 			if exp, ok := ParseJWTExpiryLocally(props.ConnectAccessToken); ok {
 				m.expiresAt = exp
 			} else {
-				m.expiresAt = m.nowFn().Add(45 * time.Minute)
+				m.expiresAt = doneNow.Add(45 * time.Minute)
 			}
 		}
 		flight.res = props
+		flight.gen = outGen
 		flight.err = err
 		m.inFlight = nil
 		close(flight.done)
 		m.mu.Unlock()
 
-		return props, err
+		return props, outGen, err
 	}
 }
 
