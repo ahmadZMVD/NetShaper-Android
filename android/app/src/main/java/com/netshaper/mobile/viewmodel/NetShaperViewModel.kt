@@ -1,12 +1,14 @@
 package com.netshaper.mobile.viewmodel
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.netshaper.mobile.engine.CodespaceItem
 import com.netshaper.mobile.engine.DeviceAuthPoll
 import com.netshaper.mobile.engine.DeviceAuthStart
 import com.netshaper.mobile.engine.Formatters
+import com.netshaper.mobile.engine.LogExportHelper
 import com.netshaper.mobile.engine.MobileSnapshot
 import com.netshaper.mobile.engine.MobileStartConfig
 import com.netshaper.mobile.engine.QuotaReport
@@ -228,7 +230,7 @@ class NetShaperViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun clearLogs() {
         NetShaperRuntime.clearLogs()
-        emitSnackbar("Terminal buffer cleared")
+        emitSnackbar("Terminal buffer cleared (archive kept)")
     }
 
     fun copyAllLogs() {
@@ -237,9 +239,59 @@ class NetShaperViewModel(application: Application) : AndroidViewModel(applicatio
             emitSnackbar("No logs to copy")
             return
         }
-        val text = current.joinToString("\n") { "${it.ts} [${it.level}] ${it.text}" }
+        val text = current.joinToString("\n") {
+            "${it.formattedLocalTime()} [${it.level}] ${it.text}"
+        }
         if (NetShaperRuntime.copyToClipboard(appContext, "NetShaper Logs", text)) {
             emitSnackbar("Copied ${current.size} log lines")
+        }
+    }
+
+    fun exportRecentLogsToUri(uri: Uri) {
+        val current = logs.value
+        val snap = snapshot.value
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    LogExportHelper.writeRecentLogsToUri(
+                        context = appContext,
+                        uri = uri,
+                        logs = current,
+                        snapshot = snap
+                    )
+                }
+            }
+            result.onSuccess { bytes ->
+                val kb = ((bytes + 1023L) / 1024L).coerceAtLeast(1L)
+                emitSnackbar("Saved ${current.size} recent lines ($kb KB)")
+            }.onFailure { err ->
+                emitSnackbar("Recent log export failed: ${err.message ?: "I/O error"}")
+            }
+        }
+    }
+
+    fun exportFullArchiveToUri(uri: Uri) {
+        val current = logs.value
+        val snap = snapshot.value
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val dir = NetShaperRuntime.logDirectory(appContext)
+                    LogExportHelper.writeFullArchiveZip(
+                        context = appContext,
+                        uri = uri,
+                        logDir = dir,
+                        snapshot = snap,
+                        recentLogs = current
+                    )
+                }
+            }
+            result.onSuccess { summary ->
+                val kb = ((summary.zipBytesWritten + 1023L) / 1024L).coerceAtLeast(1L)
+                emitSnackbar("Saved full archive (${summary.fileCount} files, $kb KB)")
+            }.onFailure { err ->
+                emitSnackbar("Archive export failed: ${err.message ?: "I/O error"}")
+            }
         }
     }
 
