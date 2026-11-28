@@ -343,7 +343,7 @@ fun TerminalScreen(
                         }
 
                         val showJumpToBottom = logs.isNotEmpty() && (!autoFollow || !isAtBottom)
-                        AnimatedVisibility(
+                        androidx.compose.animation.AnimatedVisibility(
                             visible = showJumpToBottom,
                             enter = fadeIn(),
                             exit = fadeOut(),
